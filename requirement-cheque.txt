@@ -1,0 +1,387 @@
+===============================================================================
+ CHEQUE RECONCILIATION — REQUIREMENT (v0 draft for review)
+ Module of the Warehouse Ops Platform (Next.js 15 + Supabase). Third "suite"
+ alongside HR System and Payroll (the "Cheque Reconciliation" tile already exists
+ as a coming-soon placeholder).
+ STATUS: BUILT & DEPLOYED (2026-07-15). All phases done — data model + lifecycle +
+ screens + manual/bulk entry + admin approvals (incl. bulk) + bank tracking +
+ reconciliation dashboard + CSV export + duplicate flagging + AI vision extraction
+ (Gemini via the S9 gateway sidecar) + a LOCAL TESSERACT OCR FALLBACK (pm2
+ `cheque-ocr`) that pre-fills printed fields when Gemini is down/quota-exhausted.
+ §12 small opens resolved: B1 field list as listed; B3 company-bank master built;
+ C2 bounce is terminal (re-present = new entry); C5 one cheque per page. Extraction
+ order: AI (Gemini) → local OCR → manual. Still recommended: HTTPS (E2) before real
+ cheque data (box is HTTP-only); full-offline use would need on-premise hosting.
+===============================================================================
+
+-------------------------------------------------------------------------------
+0. DECISIONS LOCKED (answered)
+-------------------------------------------------------------------------------
+- Images: EXTRACT-AND-FORGET. No image storage; transient use only. (E4 resolved)
+- Input: mostly SCANNED PDF + images; PDF rasterized per page (client pdf.js). (C5 pending)
+- Bulk upload: YES, core. Many files and/or a multi-page PDF (1 cheque/page). (C3)
+- Volume: 50–100/day → extraction queued/throttled to AI rpm; OCR immediate. (E1)
+- EXTRACTION ARCH: AI-VISION PRIMARY via the S9 llm_gatewayV9 run as a PYTHON SIDECAR
+  (Gemini vision does OCR+parse, quota-aware failover) + free local OCR (Tesseract) as
+  the offline/quota fallback. (A1/A2/A3/A4 resolved)
+- Dealer: FREE TEXT read off the cheque. No dealer master table. (B2 resolved)
+- Access: ALL managers see ALL cheques. (D1 resolved)
+- Reconciliation v1: TRACK each cheque to passed/bounced + status dashboard. No
+  bank-statement auto-matching in v1. (D2 resolved)
+STILL TO CONFIRM (small — proposed defaults): B1 field list, B3 our-bank tracking,
+C2 bounced re-presentable, C5 one-cheque-per-page. See §12.
+
+-------------------------------------------------------------------------------
+1. PURPOSE / ONE-LINER
+-------------------------------------------------------------------------------
+Managers receive physical cheques from dealers, scan/upload them. The system uses
+OCR + AI to auto-extract the cheque details and pre-fill a form. The manager
+reviews/edits and submits for admin approval. The admin approves (cheque becomes
+"submitted"), later records when it was presented to the company's bank, and
+finally marks it "passed" (cleared) or "bounced". The module tracks each cheque
+through this lifecycle and gives a reconciliation view of what is outstanding,
+presented, cleared, or bounced.
+
+This is a CHEQUE-TRACKING + APPROVAL workflow with AI-assisted data entry. It is
+financially independent of the HR/attendance/payroll data (dealers ≠ employees).
+
+-------------------------------------------------------------------------------
+2. ACTORS & ROLES (reuse existing auth: admin / manager)
+-------------------------------------------------------------------------------
+- MANAGER: uploads scanned cheque images; the system pre-fills fields; the
+  manager reviews/edits and SUBMITS FOR APPROVAL. Cannot approve. Cannot change a
+  cheque once approved.
+- ADMIN: reviews submitted cheques in an approvals queue; APPROVES (→ "submitted")
+  or REJECTS (with reason, back to the manager). After approval the admin records
+  bank PRESENTATION and the final OUTCOME (passed/bounced). Sees the full
+  reconciliation dashboard.
+- (Open) whether managers are scoped to only their own uploaded cheques / their
+  groups, or see all — see §12.
+
+-------------------------------------------------------------------------------
+3. CHEQUE LIFECYCLE (state machine)
+-------------------------------------------------------------------------------
+States (proposed):
+  draft         -> manager uploaded; OCR/AI extraction done; manager editing
+  pending       -> manager submitted for admin approval (locked from manager edit)
+  rejected      -> admin rejected (reason); returns to manager to fix -> draft
+  submitted     -> admin approved (figures frozen; cheque accepted into the system)
+  presented     -> admin recorded date it was deposited/presented to OUR bank
+  passed        -> admin recorded the cheque cleared (with clear date)
+  bounced       -> admin recorded the cheque bounced (with reason + date)
+
+Transitions & who:
+  (manager) upload+extract ......... -> draft
+  (manager) edit fields ............ draft -> draft
+  (manager) submit ................. draft -> pending
+  (admin)   reject(reason) ......... pending -> rejected -> (manager) -> draft
+  (admin)   approve ................ pending -> submitted
+  (admin)   record presented(date, our-bank-account) .. submitted -> presented
+  (admin)   mark passed(date) ...... presented -> passed        [terminal]
+  (admin)   mark bounced(reason,date) presented -> bounced      [terminal]
+  (admin, open) can a bounced cheque be re-presented? -> §12
+
+Notes:
+- Only admin advances submitted->presented->passed/bounced.
+- Approval "freezes" the extracted/edited field values (like payroll snapshotting).
+- Every transition is written to the audit log (actor, before/after, reason).
+
+-------------------------------------------------------------------------------
+4. DATA MODEL (proposed; field names indicative)
+-------------------------------------------------------------------------------
+TABLE cheques
+  id                uuid pk
+  status            enum(draft,pending,rejected,submitted,presented,passed,bounced)
+  -- IMAGE IS NOT STORED. Decision: "extract and forget" — the uploaded image is used
+  -- transiently (OCR + AI extraction, and the manager's review in the same session),
+  -- then discarded. No storage bucket, no image_path column. Only the fields below persist.
+  -- extracted / editable fields (the "form"):
+  cheque_number     text
+  cheque_date       date          -- date written ON the cheque (may be post-dated)
+  dealer_name       text          -- (OPEN §12: drawer on the cheque vs a dealer master pick)
+  dealer_id         uuid null     -- if a dealer master exists
+  bank_name         text          -- drawee bank (the dealer's bank, printed)
+  branch            text null
+  ifsc              text null
+  account_number    text null
+  micr_code         text null     -- 9-digit MICR band
+  amount            numeric(12,2) -- (OPEN §12: is amount a captured field? assumed YES)
+  amount_in_words   text null
+  payee_name        text null     -- who the cheque is payable to (likely our company)
+  notes             text null
+  -- workflow / audit fields:
+  upload_date       timestamptz default now()   -- when uploaded to the system
+  received_date     date null                   -- when the dealer physically gave it (OPEN)
+  uploaded_by       uuid -> profiles
+  submitted_at      timestamptz null
+  decided_by        uuid null -> profiles       -- admin who approved/rejected
+  decided_at        timestamptz null
+  decision_reason   text null                   -- rejection reason
+  -- bank tracking (admin only):
+  our_bank_account_id uuid null   -> company_bank_accounts (OPEN: needed?)
+  presented_date    date null
+  cleared_date      date null
+  bounce_reason     text null
+  -- extraction metadata:
+  extraction_source text null     -- 'ai' | 'ocr' | 'manual'
+  extraction_confidence jsonb null -- per-field confidence, if available
+  extracted_raw     jsonb null    -- raw model/OCR output for audit/debug
+  created_at        timestamptz default now()
+
+TABLE company_bank_accounts (OPEN §12 — only if we track which of our accounts)
+  id, label, bank_name, account_number, ifsc, is_active
+
+TABLE dealers (OPEN §12 — only if a dealer master is wanted)
+  id, name, phone, notes, is_active
+
+(Reuse existing audit_log for the trail.)
+
+-------------------------------------------------------------------------------
+5. FIELD EXTRACTION PIPELINE (OCR + AI) — the heart of the feature
+-------------------------------------------------------------------------------
+Goal: on upload, auto-fill as many fields as possible; manager corrects the rest.
+The extraction MUST degrade gracefully (never block the manager; manual entry is
+always possible; AI quota exhaustion must not break the flow).
+
+INPUT: mostly SCANNED PDF (+ jpg/png). PDFs are rasterized per page to an image FIRST
+(client-side via pdf.js), because both the OCR stage and the AI vision endpoint work on
+images. One cheque per page (assumed) → one draft per page.
+
+Design principle (per your steer): "OCR first, then AI; AI is limited quota."
+Proposed two-stage, degrade-gracefully pipeline:
+
+  STAGE 1 — OCR (always available, unlimited, cheap):
+    - Run an OCR engine on the cheque image to get raw text + the MICR line.
+    - Reliable for PRINTED fields: cheque number, MICR code, bank name, IFSC,
+      account number (printed), amount-in-figures IF printed.
+    - Weak on HANDWRITING (date, payee, amounts are usually handwritten on cheques).
+    - Candidate engines (OPEN §12): Tesseract (free, local), or a cloud OCR
+      (Google Vision / AWS Textract / Azure) which handles handwriting far better
+      but costs per page.
+
+  STAGE 2 — AI vision model (accurate, LIMITED QUOTA, via the LLM gateway):
+    - Send the cheque image to the AI vision model with a strict JSON schema of the
+      cheque fields; it returns all fields (including handwritten) as validated JSON.
+    - This is where quota is a concern → use the multi-LLM GATEWAY (see §6) so that
+      when the primary model's quota is exhausted, it fails over to another.
+    - If ALL AI providers are exhausted/unavailable → fall back to Stage-1 OCR
+      pre-fill only (+ manual entry). Record extraction_source accordingly.
+
+  MERGE: prefer AI values where present & confident; fill gaps from OCR; leave the
+  rest blank. Store per-field source/confidence so low-confidence fields can be
+  visually flagged for the manager to double-check.
+
+  (OPEN §12: is the pipeline truly two-stage OCR→AI, or is the AI vision model the
+  PRIMARY extractor with OCR only as the offline/quota fallback? The vision LLM
+  actually does OCR+parse in one step and handles handwriting best, so "AI primary,
+  OCR fallback" may be more accurate — but "OCR first" is your stated preference.
+  Needs a decision — see §12.)
+
+MANUAL OVERRIDE: every field is editable by the manager before submit, regardless
+of how it was filled. Low-confidence / unfilled fields are highlighted.
+
+-------------------------------------------------------------------------------
+6. AI / OCR ARCHITECTURE — reusing the S9 LLM GATEWAY
+-------------------------------------------------------------------------------
+You already have a multi-LLM gateway at:
+  ~/Desktop/projects/EAGv3/S9SharedCode/llm_gatewayV9/   (FastAPI, Python 3.11)
+
+What it gives us (directly relevant):
+- Endpoint POST /v1/vision : { image (base64 data-url or https URL), prompt,
+  schema (JSON schema), schema_name, provider?, max_tokens, temperature } ->
+  ChatResponse with .parsed = validated JSON object. It routes to a VISION-capable
+  provider, and VALIDATES output against the schema with one corrective retry.
+- Providers wired: Gemini (the vision worker), NVIDIA, Groq, Cerebras, OpenRouter,
+  GitHub Models, Ollama. Vision today = Gemini (and possibly gpt-4.1-mini via GitHub).
+- QUOTA-AWARE FAILOVER (exactly the concern you raised): before each call a provider
+  is skipped if it's over RPM/RPD/TPM or in a backoff window; on a 429/quota error
+  the provider is put in cooldown (quota/rpm -> 60s, per-day -> 3600s) and the next
+  provider is tried; if all are exhausted -> HTTP 503. Per-provider limits are
+  hardcoded and tunable. There's also a SQLite call log + per-agent cost rollup.
+- No built-in OCR (Tesseract). It does OCR through the vision LLM. So "Stage 1 OCR"
+  (if we want a non-LLM OCR) is a SEPARATE component we add.
+
+Integration options (OPEN §12 — pick one):
+  (A) RUN THE GATEWAY AS A PYTHON SIDECAR the Next.js app calls over localhost.
+      - Deploy llm_gatewayV9/ (uvicorn on :8109) next to the app (Lightsail box or a
+        small separate box). Set provider API keys in its .env. Our server actions
+        POST the cheque image to /v1/vision with the cheque JSON schema.
+      - Pros: reuse routing/failover/validation/cost-ledger as-is; least AI code in
+        our app. Cons: adds a Python runtime (~150-250MB) to the 1GB Lightsail box;
+        gateway loads its .env from the PARENT dir (deploy gotcha); no auth on its
+        HTTP surface (keep it bound to localhost / add a shared secret).
+  (B) PORT THE ROUTING LOGIC TO NODE. The valuable IP is ~150 lines (rate-state
+      gate + error→cooldown backoff map + failover loop). Reimplement in TS around
+      provider SDKs (Gemini etc.). Pros: all-Node, no Python; Cons: we re-own/maintain
+      the routing + must add each provider adapter.
+  (C) SINGLE CLOUD DOCUMENT-AI (no gateway): e.g. Google Document AI / AWS Textract
+      "expense/id" style or a single vision API with a paid quota. Simplest, but
+      costs per page and drops the multi-model free-tier fallback you want.
+
+OCR-engine placement (if we keep a non-LLM OCR Stage 1):
+  - Tesseract via tesseract.js (Node, runs in the app) — free, no extra service.
+  - Or pytesseract in the Python sidecar (co-located with the gateway).
+  - Or a cloud OCR API.
+
+-------------------------------------------------------------------------------
+7. SCREENS / UX (fits the existing suite→feature nav; dense internal-tool style)
+-------------------------------------------------------------------------------
+Suite: "Cheque Reconciliation" (flip the coming-soon tile on).
+
+MANAGER features:
+  - "Upload cheques" — BULK UPLOAD IS A CORE REQUIREMENT (C3 = YES):
+    * INPUT IS MOSTLY PDF (scanned copies), plus images (jpg/png). Accept both.
+    * PDF handling: each PDF is RASTERIZED per page into an image before OCR/AI (the
+      vision endpoint takes an image, not a PDF). Do this CLIENT-SIDE (pdf.js in the
+      browser renders each page to a canvas → image) — fits extract-and-forget (nothing
+      hits the server but the transient page image) and needs no server PDF tooling.
+      Rasterize at a legible DPI (~150–200) for OCR/AI accuracy; images aren't stored.
+    * A multi-page PDF is treated as ONE CHEQUE PER PAGE → N drafts from an N-page PDF.
+      (OPEN §12 C5: is it always exactly one cheque per page, or can a page hold 2+
+      cheques scanned together? The latter needs page→region splitting.)
+    * Drag/drop or select MANY files at once — a batch may be many single files AND/OR
+      one big multi-page PDF (e.g. a 50-page scan = 50 cheques). Target ~50–100/batch.
+    * The browser holds the pages/images (not the server — extract-and-forget) and sends
+      each through extraction: OCR immediately, then AI throttled to the ~15 rpm limit. A
+      progress indicator shows "extracted X of N"; each finished cheque becomes an
+      editable DRAFT row/card (fields from §4), low-confidence/blank fields highlighted.
+    * Because images aren't stored, extraction runs during this session. Each cheque's
+      fields are SAVED as a draft as soon as extracted, so partial progress survives if
+      the manager stops (the un-extracted, un-saved images are simply lost → re-upload;
+      the manager still holds the physical cheques).
+    * The manager reviews/edits each draft, then submits — individually OR "Submit all"
+      (bulk submit the reviewed drafts for approval). Per-cheque status chip.
+    * (Optional) per-cheque "Re-extract"/retry AI while the image is still in the browser.
+  - "My cheques": list of the manager's cheques with status + filters + bulk actions.
+
+ADMIN (bulk-friendly): the approvals queue should allow selecting multiple pending
+cheques and approving/rejecting in bulk (reject still needs a reason).
+
+ADMIN features (in the existing ONE approvals-style flow, no extra tabs where
+possible — you prefer folding into existing queues):
+  - "Cheque approvals": queue of PENDING cheques → view image + fields → Approve or
+    Reject(reason).
+  - "Bank tracking": SUBMITTED cheques → record Presented(date [+ our bank account]);
+    PRESENTED cheques → mark Passed(clear date) or Bounced(reason, date).
+  - "Reconciliation dashboard": totals & lists by status — outstanding (submitted,
+    not presented), presented (awaiting clearance), passed, bounced; by dealer /
+    date range / bank; amounts summed. (Scope of "reconciliation" — see §12.)
+
+-------------------------------------------------------------------------------
+8. INTEGRATION WITH THE EXISTING APP
+-------------------------------------------------------------------------------
+- Add SUITE "cheque" real features in src/lib/suites.ts (currently comingSoon).
+- Roles/RLS: cheques table with RLS — manager insert/update own DRAFT cheques;
+  read own (or all, §12); admin ALL. Bank-tracking + approve via security-definer
+  RPCs (managers cannot touch admin fields), mirroring the payroll/onboarding pattern.
+- Storage: NONE for images (decision: extract-and-forget). No bucket, no signed URLs.
+  Only extracted/edited field data is persisted. Removes all image storage cost/privacy
+  concerns. CONSEQUENCE: the ADMIN approves from the DATA ONLY (no image to eyeball) —
+  the MANAGER is the human who verified the fields against the PHYSICAL cheque at upload.
+  Also no image for later dispute/re-extraction; the physical cheque is the source of truth.
+- Audit: reuse audit_log for every state transition.
+- Extraction call: a server action calls the gateway (or Node routing) → fills draft.
+- Migrations follow existing conventions (idempotent; ordered SQL).
+
+-------------------------------------------------------------------------------
+9. NON-FUNCTIONAL / CONSTRAINTS
+-------------------------------------------------------------------------------
+- Images are NOT stored (extract-and-forget) → no image storage/retention/privacy
+  surface at all. The transient image lives only in memory/temp during extraction and
+  the manager's same-session review, then is dropped. Extracted DATA still contains
+  sensitive values (account no, MICR) → protect the cheques table via RLS as usual.
+- Resilience: AI quota exhaustion or gateway down must NOT block uploads — always
+  allow manual entry; extraction is best-effort/async.
+- Volume: 50–100 cheques/day. AI DAILY quota is fine (Gemini free ~1000/day), but the
+  ~15 rpm limit means batch uploads must be QUEUED/THROTTLED so extraction respects the
+  rate limit. Since the image isn't kept, extraction happens IN THE UPLOAD SESSION
+  (OCR immediately; AI a moment later) and the manager reviews before the image is
+  dropped — a large batch is processed a few at a time with visible progress.
+- Accuracy: cheques vary hugely by bank; expect the manager to correct ~some fields.
+  Amount + cheque number + date accuracy matter most (money). Never auto-submit;
+  always human-reviewed before "submitted".
+- Cost: prefer the gateway's free-tier models; if a paid cloud OCR is chosen, note
+  per-page cost.
+- Latency: extraction a few seconds/cheque; show a spinner / process async per image.
+- The app is currently HTTP-only on Lightsail — add HTTPS before real cheque data.
+
+-------------------------------------------------------------------------------
+10. PHASING (your steer: OCR first, AI after)
+-------------------------------------------------------------------------------
+Phase 1: data model + lifecycle + screens + manual entry (no extraction). Managers
+         upload + type fields; admin approve/track/outcome; reconciliation view.
+Phase 2: OCR stage (pre-fill printed fields: cheque no, MICR, bank, IFSC, amount-fig).
+Phase 3: AI vision extraction via the gateway (all fields incl. handwriting) with
+         quota-aware failover; graceful degrade to OCR/manual.
+(Each phase is independently shippable; the workflow works from Phase 1.)
+
+-------------------------------------------------------------------------------
+11. OUT OF SCOPE (v1, unless stated)
+-------------------------------------------------------------------------------
+- Automatic bank-statement import & auto-matching (unless §12 says otherwise).
+- Accounting/ledger integration, GST, invoices.
+- Multi-company / multi-branch.
+- Cheque printing / issuance (this is RECEIVING dealer cheques, not issuing).
+- Payment gateways / e-collections.
+
+-------------------------------------------------------------------------------
+12. OPEN QUESTIONS / DECISIONS NEEDED (please answer before build)
+-------------------------------------------------------------------------------
+A. EXTRACTION ARCHITECTURE:
+   A1. Pipeline: (i) OCR-first then AI-augment, or (ii) AI vision as primary with
+       OCR as offline/quota fallback? (Vision LLM is most accurate for handwriting.)
+   A2. Gateway integration: (A) Python sidecar of llm_gatewayV9, (B) port routing to
+       Node, or (C) single paid cloud OCR/vision? Where does it run — the Lightsail
+       box (1GB) or a separate machine?
+   A3. OCR engine (if Stage 1 kept): Tesseract (free) or cloud OCR (Textract/Vision,
+       paid, better handwriting)?
+   A4. Which AI providers/models to use for vision (Gemini free tier is the default
+       vision worker in the gateway) — any preference/limits?
+
+B. FIELDS & MASTERS:
+   B1. Confirm the FULL field list to capture (is AMOUNT captured? amount-in-words?
+       payee? account no? MICR? IFSC? branch? any others?).
+   B2. "Dealer name" — is it (i) the drawer/account-holder name read off the cheque,
+       or (ii) a selection from a DEALER MASTER list we maintain? Do you want a
+       dealers table?
+   B3. Do we track WHICH company bank account the cheque was presented to (a
+       company_bank_accounts master), or is that not needed?
+   B4. Is there a "received date" (when the dealer physically handed the cheque),
+       separate from the system upload date?
+
+C. WORKFLOW:
+   C1. On admin REJECT, does it go back to the manager to fix and re-submit? (assumed yes)
+   C2. Can a BOUNCED cheque be re-presented (new cycle) or is bounced terminal?
+   C3. Batch upload of many cheques at once — needed in v1? (assumed yes)
+   C4. Any amount/《cheque-number》duplicate detection (same cheque uploaded twice)?
+   C5. Input is mostly SCANNED PDF. Is it always exactly ONE CHEQUE PER PAGE (so an
+       N-page PDF = N cheques), or can a single page contain MULTIPLE cheques scanned
+       together (which would need page→region splitting before extraction)?
+
+D. SCOPE / ACCESS:
+   D1. Are cheques scoped to the uploading manager / their groups, or do all managers
+       see all cheques? Who can view the cheque IMAGE (uploader + admin only)?
+   D2. Does "reconciliation" mean just tracking each cheque to passed/bounced (v1), or
+       also importing bank statements to auto-match (later)?
+   D3. Any reporting/export needed (CSV of cheques by status/dealer/date)?
+
+E. NON-FUNCTIONAL:
+   E1. Volume: ANSWERED = 50–100 cheques/day. Implications:
+       - AI daily quota is fine: Gemini free tier ~1000 requests/day >> 100/day.
+         BUT its per-MINUTE limit is ~15 rpm, so a manager batch-uploading 50 at once
+         would blow the rpm and get rate-limited/backed-off. => Extraction MUST be
+         QUEUED + THROTTLED and run ASYNC (not block the upload). OCR (unlimited, local)
+         gives the immediate pre-fill; AI fills in over the next few minutes and updates
+         the draft. The gateway's failover adds headroom (Gemini + gpt-4.1-mini are the
+         vision-capable workers).
+       - STORAGE: RESOLVED — images are NOT stored (extract-and-forget), so there is no
+         image storage growth/cost at all. Only field data persists.
+   E4. RESOLVED — no image storage (extract-and-forget). Consequence to accept: the admin
+       approves from DATA ONLY (no image), and there is no image for later dispute; the
+       physical cheque + the manager's at-upload verification are the source of truth.
+   E2. Add HTTPS/domain before storing real cheque images? (recommended)
+   E3. Retention/privacy rules for cheque images (how long kept, who can download)?
+
+===============================================================================
+ END — awaiting answers to §12, then we design the schema + build Phase 1.
+===============================================================================

@@ -1,0 +1,104 @@
+@import "tailwindcss";
+
+/* ─────────────────────────────────────────────────────────────────────────
+   Warehouse Ops design system. Clean, modern, professional admin UI.
+   Token names are kept stable (ink/muted/line/surface/bg/brand/danger/warn/ok)
+   so every existing screen picks up the refreshed look automatically.
+   ───────────────────────────────────────────────────────────────────────── */
+
+@theme {
+  /* Neutrals (slate) */
+  --color-ink: #0f172a; /* primary text */
+  --color-muted: #64748b; /* secondary text */
+  --color-faint: #94a3b8; /* tertiary / placeholders */
+  --color-line: #e5e9f0; /* borders */
+  --color-line-strong: #cbd5e1;
+  --color-surface: #ffffff; /* cards */
+  --color-surface-2: #f8fafc; /* subtle fills, table heads */
+  --color-bg: #f1f4f9; /* page background */
+
+  /* Brand (indigo) */
+  --color-brand: #4f46e5;
+  --color-brand-strong: #4338ca;
+  --color-brand-soft: #eef2ff;
+
+  /* Status */
+  --color-ok: #15803d;
+  --color-ok-soft: #dcfce7;
+  --color-warn: #b45309;
+  --color-warn-soft: #fef3c7;
+  --color-danger: #be123c;
+  --color-danger-soft: #ffe4e6;
+  --color-info: #0369a1;
+  --color-info-soft: #e0f2fe;
+
+  /* Accents for suite tiles */
+  --color-accent-emerald: #059669;
+  --color-accent-violet: #7c3aed;
+  --color-accent-amber: #d97706;
+  --color-accent-sky: #0284c7;
+
+  --radius: 0.625rem;
+  --shadow-sm: 0 1px 2px 0 rgb(15 23 42 / 0.04), 0 1px 3px 0 rgb(15 23 42 / 0.06);
+  --shadow-md: 0 2px 4px -1px rgb(15 23 42 / 0.06), 0 8px 16px -4px rgb(15 23 42 / 0.10);
+  --shadow-lg: 0 12px 32px -8px rgb(15 23 42 / 0.18);
+
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+}
+
+html,
+body {
+  background: var(--color-bg);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+* {
+  border-color: var(--color-line);
+}
+
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Focus ring for keyboard users on interactive elements */
+a:focus-visible,
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid var(--color-brand);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
+/* Form controls inherit a consistent look */
+input,
+select,
+textarea {
+  background: var(--color-surface);
+}
+input::placeholder,
+textarea::placeholder {
+  color: var(--color-faint);
+}
+
+/* Subtle card entrance */
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.rise {
+  animation: rise 0.18s ease-out both;
+}

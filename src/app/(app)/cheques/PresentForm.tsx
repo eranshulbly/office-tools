@@ -64,7 +64,18 @@ export function PresentForm({
             <option key={a.id} value={a.id}>{a.label}</option>
           ))}
         </select>
-        <input type="date" value={date} onChange={(e) => setDate(e.target.value)} className={INPUT} />
+        {/* This is the date we bank the cheque — NOT the date on the cheque. Say so,
+            or it reads as the cheque's own date sitting next to the summary. */}
+        <label className="flex items-center gap-1.5 text-xs text-muted whitespace-nowrap">
+          Banking on
+          <input
+            type="date"
+            value={date}
+            onChange={(e) => setDate(e.target.value)}
+            title="Date this cheque is presented to the bank"
+            className={INPUT}
+          />
+        </label>
         <button type="button" className={`${BTN} whitespace-nowrap`} onClick={present} disabled={pending || accounts.length === 0}>
           {pending ? "Saving…" : "Mark presented"}
         </button>

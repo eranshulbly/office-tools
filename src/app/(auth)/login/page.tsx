@@ -2,7 +2,7 @@
 
 import { Suspense, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
-import { createSupabaseBrowserClient } from "@/lib/supabase/client";
+import { signIn } from "./actions";
 
 export default function LoginPage() {
   // useSearchParams (in LoginForm) requires a Suspense boundary to prerender.
@@ -49,13 +49,16 @@ function LoginForm() {
     e.preventDefault();
     setBusy(true);
     setError(null);
-    const supabase = createSupabaseBrowserClient();
-    // Allow a bare username (e.g. "manager") — map it to an internal email.
-    const raw = email.trim();
-    const loginEmail = raw.includes("@") ? raw : `${raw}@warehouse.local`;
-    const { error } = await supabase.auth.signInWithPassword({ email: loginEmail, password });
+    // The credential check runs server-side now (see ./actions.ts) — the
+    // password never touches a client SDK, and the session cookie it sets is
+    // httpOnly so client JavaScript cannot read it. Bare usernames are still
+    // mapped to the internal email, inside the action.
+    const fd = new FormData();
+    fd.set("email", email.trim());
+    fd.set("password", password);
+    const { error } = await signIn(null, fd);
     if (error) {
-      setError(error.message);
+      setError(error);
       setBusy(false);
       return;
     }

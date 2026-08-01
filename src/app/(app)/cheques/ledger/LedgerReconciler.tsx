@@ -3,7 +3,6 @@
 import { useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Card, Section, Badge, Table, Th, Td, Empty, money, FormError, FormOk } from "@/components/ui";
-import { FIRMS, DEFAULT_FIRM, type Firm } from "@/lib/upi";
 import {
   parseLedger,
   matchCheques,
@@ -26,9 +25,14 @@ function d(v: string | null | undefined): string {
   return v ? new Date(v).toLocaleDateString("en-IN") : "—";
 }
 
-export function LedgerReconciler({ cheques }: { cheques: SystemCheque[] }) {
+/**
+ * `firm` now comes from the suite-wide selection rather than a dropdown here.
+ * Having a second, independent firm control on this page meant the statement
+ * could be matched as one firm while the cheque list on screen belonged to
+ * another — the two are now guaranteed to agree.
+ */
+export function LedgerReconciler({ cheques, firm }: { cheques: SystemCheque[]; firm: string }) {
   const router = useRouter();
-  const [firm, setFirm] = useState<Firm>(DEFAULT_FIRM);
   const [rows, setRows] = useState<string[][] | null>(null);
   const [ledgerStats, setLedgerStats] = useState<{ deposits: number; returns: number } | null>(null);
   const [fileName, setFileName] = useState("");
@@ -105,11 +109,9 @@ export function LedgerReconciler({ cheques }: { cheques: SystemCheque[] }) {
   return (
     <div className="space-y-6">
       <div className="flex flex-wrap items-center gap-2">
-        <span className="text-sm font-medium text-muted">Firm</span>
-        <select value={firm} onChange={(e) => setFirm(e.target.value as Firm)} className={selectClass}>
-          {FIRMS.map((f) => <option key={f} value={f}>{f}</option>)}
-        </select>
-        <span className="text-xs text-muted">{cheques.length} outstanding cheque{cheques.length === 1 ? "" : "s"} to reconcile</span>
+        <span className="text-xs text-muted">
+          {cheques.length} outstanding cheque{cheques.length === 1 ? "" : "s"} for {firm} to reconcile
+        </span>
       </div>
 
       <Card className="p-6 text-center border-2 border-dashed">
@@ -127,8 +129,8 @@ export function LedgerReconciler({ cheques }: { cheques: SystemCheque[] }) {
           </button>
         </div>
         <p className="mt-3 text-xs text-muted">
-          Read in your browser — nothing is uploaded. A cheque is settled only on an exact number + amount match. Where the statement
-          names the party it must agree with your dealer; where it names no one, the number + amount must identify a single cheque.
+          Read in your browser — nothing is uploaded. A cheque is settled on an exact cheque number + amount match; the party name on
+          the statement is ignored. The name is used only to break a tie when the same number + amount covers more than one cheque.
         </p>
         <div className="mt-2"><FormError message={error} />{ok && <FormOk message={ok} />}</div>
       </Card>
@@ -192,7 +194,7 @@ export function LedgerReconciler({ cheques }: { cheques: SystemCheque[] }) {
                       <Td className="whitespace-nowrap text-xs">
                         {r.nameVerified
                           ? <span className="text-[var(--color-ok)]">No. + amount + party</span>
-                          : <span className="text-[var(--color-warn)]">No. + amount only</span>}
+                          : <span className="text-muted">No. + amount</span>}
                       </Td>
                       <Td className="text-muted text-xs">
                         <span className="block max-w-xs truncate" title={r.note}>{r.note}</span>

@@ -74,9 +74,10 @@ export function ReconLists({
   const query = q.trim().toLowerCase();
 
   /**
-   * "Dated before" filter. cheque_date is stored as ISO (yyyy-mm-dd), so a plain
-   * string compare is a correct date compare. A cheque with no date can't be
-   * shown to fall before the cut-off, so it's excluded while the filter is on.
+   * "Dated before" filter — strictly earlier than the chosen day. cheque_date is
+   * stored as ISO (yyyy-mm-dd), so a plain string compare is a correct date
+   * compare. A cheque with no date can't be shown to fall before the cut-off, so
+   * it's excluded while the filter is on (that count is surfaced below the bar).
    */
   const datedBefore = (chequeDate: string | null) =>
     !before || (!!chequeDate && chequeDate.slice(0, 10) < before);
@@ -95,6 +96,15 @@ export function ReconLists({
   );
 
   const emptyText = (base: string) => (query || before ? "No cheques match your filters." : base);
+
+  // Cheques with a blank cheque date can't be placed against the cut-off, so the
+  // filter drops them. Say so rather than letting them disappear unexplained.
+  const undatedHidden = useMemo(() => {
+    if (!before) return 0;
+    const source: { cheque_date: string | null }[] =
+      tab === "present" ? present : tab === "awaiting" ? awaiting : settled;
+    return source.filter((c) => !c.cheque_date).length;
+  }, [before, tab, present, awaiting, settled]);
 
   const TABS: { key: Tab; label: string; count: number }[] = [
     { key: "present", label: "To present to bank", count: fPresent.length },
@@ -160,6 +170,13 @@ export function ReconLists({
         )}
       </div>
 
+      {undatedHidden > 0 && (
+        <div className="mb-4 text-xs text-muted">
+          {undatedHidden} cheque{undatedHidden === 1 ? " has" : "s have"} no cheque date recorded and{" "}
+          {undatedHidden === 1 ? "is" : "are"} hidden while this date filter is on.
+        </div>
+      )}
+
       {tab === "present" && (
         fPresent.length === 0 ? (
           <Empty>{emptyText("No cheques waiting to be presented.")}</Empty>
@@ -182,7 +199,9 @@ export function ReconLists({
                 <div className="min-w-0 text-sm lg:flex-1">
                   <div>
                     <span className="font-semibold text-ink tabular">{c.amount != null ? money(c.amount) : "—"}</span>
-                    <span className="text-muted"> · {c.dealer_name ?? "—"} · #{c.cheque_number ?? "—"}</span>
+                    <span className="text-muted">
+                      {" "}· {c.dealer_name ?? "—"} · #{c.cheque_number ?? "—"} · dated {d(c.cheque_date)}
+                    </span>
                   </div>
                   {c.notes?.trim() && (
                     <div className="mt-1 text-xs text-muted">
@@ -211,6 +230,7 @@ export function ReconLists({
                 <Th>Dealer</Th>
                 <Th>Payee</Th>
                 <Th className="text-right">Amount</Th>
+                <Th>Cheque date</Th>
                 <Th>Settled</Th>
                 <Th>Detail</Th>
               </tr>
@@ -225,6 +245,7 @@ export function ReconLists({
                   <Td>{c.dealer_name ?? "—"}</Td>
                   <Td className="text-muted">{c.payee_name ?? "—"}</Td>
                   <Td className="text-right tabular">{c.amount != null ? money(c.amount) : "—"}</Td>
+                  <Td className="tabular whitespace-nowrap">{d(c.cheque_date)}</Td>
                   <Td>{d(c.cleared_date)}</Td>
                   <Td className="text-muted text-xs">{c.status === "bounced" ? c.bounce_reason ?? "—" : "—"}</Td>
                 </tr>

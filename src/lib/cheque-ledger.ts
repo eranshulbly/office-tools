@@ -14,14 +14,18 @@
  * from the deposit. Chq./Ref.No. on a CHQ row is the drawer's cheque number,
  * zero-padded to 16 digits (strip leading zeros before matching).
  *
- * Match key: cheque number + amount (the hard key — unique for ~99% of rows).
- * A number+amount that maps to more than one drawer is AMBIGUOUS → skipped.
- * When the row DOES name a party it must be fuzzy-compatible with our dealer,
- * else the number+amount coincidentally hit someone else → skipped. Many rows
- * carry no party at all ("CHQ DEP - CTS CLG1 - BAREILLY"); those fall back to
- * number+amount alone, which stays safe because we additionally refuse the match
- * when two of OUR cheques share that same number and amount.
- * Outcome: net = #deposits − #returns for the (number+amount+drawer) cheque.
+ * Match key: cheque number + amount — and that key ALONE decides the match
+ * whenever it is unique, i.e. it picks out exactly one of our cheques and at
+ * most one party in the statement. The party name is never required in that
+ * case: a statement row that names nobody, or names someone spelled differently
+ * from our dealer, still matches. Number + amount is the identity.
+ *
+ * The name is consulted ONLY as a tiebreaker — when the same number + amount
+ * covers more than one of our cheques, or more than one party in the statement.
+ * There the name is the only thing that can tell them apart, so it must single
+ * out exactly one; if it can't, the cheque is skipped rather than guessed.
+ *
+ * Outcome: net = #deposits − #returns for the matched cheque.
  * net > 0 → eventually cleared (passed); net = 0 → all came back (bounced).
  */
 
@@ -54,9 +58,10 @@ export type MatchResult = {
   note: string; // human explanation (bounce reason, or why skipped)
   drawer?: string;
   /**
-   * True when the statement carried a party name and it matched our dealer.
-   * False when the statement row had no name and we matched on cheque number +
-   * amount alone (still safe — that pairing must be unique on both sides).
+   * True only when the party name was needed to break a tie — several of our
+   * cheques, or several statement parties, shared this number + amount. False on
+   * the normal path, where number + amount was unique and the name was never
+   * consulted at all.
    */
   nameVerified?: boolean;
   presentedDate?: string; // ISO — earliest deposit
@@ -285,44 +290,56 @@ export function matchCheques(ledger: ParsedLedger, cheques: SystemCheque[], firm
     // party at all ("CHQ DEP - CTS CLG1 - BAREILLY"), so absence is normal.
     const named = grp.deposits.map((d) => d.drawer).filter((n) => nameTokens(n).length > 0);
     const distinctNamed = new Set(named.map((n) => nameTokens(n).join(" ")));
-    if (distinctNamed.size > 1) {
-      return { cheque: c, outcome: null, skip: "ambiguous", note: "Number + amount matches more than one party in the statement." };
-    }
 
-    let drawer: string | undefined;
+    let drawer: string | undefined = distinctNamed.size === 1 ? named[0] : undefined;
     let nameVerified = false;
+    let deposits = grp.deposits;
 
-    if (distinctNamed.size === 1) {
-      // The statement names a party — it must agree with our dealer.
-      drawer = named[0];
-      if (!namesCompatible(drawer, c.dealer_name)) {
-        return { cheque: c, outcome: null, skip: "name_mismatch", note: `Number + amount matched, but the statement party "${drawer}" doesn't match "${c.dealer_name ?? ""}".`, drawer };
+    // Is cheque number + amount enough on its own? It is whenever the pairing
+    // picks out exactly one of our cheques AND at most one party in the
+    // statement. In that case the name is NOT consulted at all — a missing or
+    // differently-spelled party name does not block the match.
+    if (siblings.length > 1 || distinctNamed.size > 1) {
+      // Not unique: the name is the only thing that can break the tie.
+      if (distinctNamed.size === 0) {
+        return { cheque: c, outcome: null, skip: "ambiguous", note: "Two of your cheques share this number and amount, and the statement names no party to tell them apart." };
       }
-      nameVerified = true;
-      // If several of our cheques share this key and more than one fits the
-      // name, we cannot say which one the statement row refers to.
+      const compatible = [...distinctNamed].filter((n) => namesCompatible(n, c.dealer_name));
+      if (compatible.length === 0) {
+        return { cheque: c, outcome: null, skip: "name_mismatch", note: `More than one cheque shares this number and amount, and no statement party matches "${c.dealer_name ?? ""}".` };
+      }
+      if (compatible.length > 1) {
+        return { cheque: c, outcome: null, skip: "ambiguous", note: "Several parties on this number and amount match your dealer — settle these by hand." };
+      }
+      const token = compatible[0];
+      drawer = named.find((n) => nameTokens(n).join(" ") === token);
+      // The name must single out exactly one of OUR cheques too.
       if (siblings.filter((s) => namesCompatible(drawer, s.dealer_name)).length > 1) {
         return { cheque: c, outcome: null, skip: "ambiguous", note: "Two of your cheques share this number, amount and party — settle these by hand.", drawer };
       }
-    } else {
-      // No party on the statement: fall back to cheque number + amount alone.
-      // Safe only while that pairing identifies exactly one of our cheques.
-      if (siblings.length > 1) {
-        return { cheque: c, outcome: null, skip: "ambiguous", note: "The statement row has no party name and two of your cheques share this number and amount.", drawer: undefined };
+      if (distinctNamed.size > 1) {
+        // Deposits here belong to different parties. A return row never carries a
+        // party, so it cannot be attributed to one of them — only a return-free
+        // group can be settled safely.
+        if (grp.returns.length > 0) {
+          return { cheque: c, outcome: null, skip: "ambiguous", note: "This number and amount covers several parties and the statement has a return that can't be attributed to one.", drawer };
+        }
+        deposits = grp.deposits.filter((d) => nameTokens(d.drawer).join(" ") === token);
       }
+      nameVerified = true;
     }
 
-    const D = grp.deposits.length;
+    const D = deposits.length;
     const R = grp.returns.length;
     const net = D - R;
     if (net < 0) {
       return { cheque: c, outcome: null, skip: "ambiguous", note: "More returns than deposits for this cheque — needs manual review.", drawer, deposits: D, returns: R };
     }
-    const unverified = nameVerified ? "" : " Matched on cheque number + amount (the statement row carries no party name).";
+    const unverified = nameVerified ? "" : " Matched on cheque number + amount.";
 
-    const presentedDate = grp.deposits.map((d) => d.date).filter(Boolean).sort()[0] || undefined;
+    const presentedDate = deposits.map((d) => d.date).filter(Boolean).sort()[0] || undefined;
     if (net > 0) {
-      const outcomeDate = grp.deposits.map((d) => d.date).filter(Boolean).sort().slice(-1)[0] || undefined;
+      const outcomeDate = deposits.map((d) => d.date).filter(Boolean).sort().slice(-1)[0] || undefined;
       const base = R > 0 ? `Cleared (deposited ${D}×, returned ${R}×, net cleared).` : "Cleared — no return in the statement.";
       return { cheque: c, outcome: "passed", note: base + unverified, drawer, nameVerified, presentedDate, outcomeDate, deposits: D, returns: R };
     }

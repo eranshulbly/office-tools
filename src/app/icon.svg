@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="Warehouse Ops">
+  <!--
+    Tab icon. Next.js App Router serves any src/app/icon.svg automatically and
+    injects the <link rel="icon"> — no layout change needed.
+
+    Designed for 16x16, which is where it actually lives. That rules out fine
+    detail: this is three chunky shapes (roof, body, shutter) with the shutter
+    knocked out in the background colour rather than drawn, so it stays legible
+    when the whole glyph is smaller than a full stop. Solid brand tile means it
+    reads on both light and dark browser chrome, which favicons cannot adapt to.
+  -->
+  <rect width="32" height="32" rx="7" fill="#4f46e5"/>
+  <!-- roof + body as one silhouette -->
+  <path d="M16 6.5 4.5 13.6v1.9h3v10.9h17V15.5h3v-1.9L16 6.5Z" fill="#fff"/>
+  <!-- shutter, cut back to the brand colour -->
+  <rect x="12.6" y="18.4" width="6.8" height="8" rx="0.8" fill="#4f46e5"/>
+  <!-- shutter slats, for a little texture at larger sizes -->
+  <g fill="#fff" opacity="0.55">
+    <rect x="13.6" y="19.6" width="4.8" height="0.9" rx="0.45"/>
+    <rect x="13.6" y="21.5" width="4.8" height="0.9" rx="0.45"/>
+  </g>
+</svg>

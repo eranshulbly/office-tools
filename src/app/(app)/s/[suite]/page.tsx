@@ -2,6 +2,9 @@ import { notFound, redirect } from "next/navigation";
 import { requireProfile } from "@/lib/auth";
 import { suiteByKey, featuresForSuite, suiteComingSoon } from "@/lib/suites";
 import { Empty } from "@/components/ui";
+import { FIRM_PICKER_PATH } from "@/lib/firm";
+
+export const dynamic = "force-dynamic";
 
 /**
  * Suite entry point. There is no intermediate tile grid — selecting a product
@@ -38,6 +41,11 @@ export default async function SuitePage({
       </div>
     );
   }
+
+  // The cheque suite is scoped to one firm at a time, so entering it lands on
+  // the firm picker rather than the first tab. That picker is a real route, so
+  // Back and the "Change firm" link both return to the same place.
+  if (suite.key === "cheque") redirect(FIRM_PICKER_PATH);
 
   const features = featuresForSuite(suite.key, profile.role, profile.full_access);
   if (features.length > 0) redirect(features[0].href);

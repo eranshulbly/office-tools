@@ -5,6 +5,8 @@ import { payeeKey } from "@/lib/cheque";
 import type { PresentAccount } from "../PresentForm";
 import { PageHeader, Card, Section, money } from "@/components/ui";
 import { ReconLists, type PresentItem, type OutcomeItem, type SettledItem } from "./ReconLists";
+import { requireFirm, listFirms, scopeToFirm } from "@/lib/firm";
+import { FirmBar } from "../FirmPicker";
 
 export const dynamic = "force-dynamic";
 
@@ -20,6 +22,8 @@ function StatCard({ label, count, amount, tone }: { label: string; count: number
 
 export default async function ChequeReconciliationPage() {
   await requireRole("admin");
+  const firm = await requireFirm();
+  const firms = await listFirms();
   const supabase = await createSupabaseServerClient();
   const fmt = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata" });
   const today = fmt.format(new Date());
@@ -27,15 +31,22 @@ export default async function ChequeReconciliationPage() {
   const presentDate = fmt.format(new Date(Date.now() + 24 * 60 * 60 * 1000));
 
   const [summaryRes, queueRes, accountsRes, settledRes] = await Promise.all([
-    supabase.from("cheques").select("status, amount"),
+    supabase.from("cheques").select("status, amount, payee_name"),
     supabase.from("cheques").select("*").in("status", ["submitted", "presented"]).order("cheque_date", { ascending: true }),
     supabase.from("company_bank_accounts").select("*").eq("is_active", true).order("label"),
     supabase.from("cheques").select("*").in("status", ["passed", "bounced"]).order("cleared_date", { ascending: false }).limit(200),
   ]);
 
+  // Everything below is scoped to the selected firm — including the status
+  // dashboard, so the headline figures always match the list underneath.
+  const summaryRows = scopeToFirm(
+    (summaryRes.data ?? []) as { status: ChequeStatus; amount: number | null; payee_name: string | null }[],
+    "payee_name", firm, firms
+  );
+
   // ── dashboard totals by status ──
   const totals = new Map<ChequeStatus, { count: number; amount: number }>();
-  for (const r of summaryRes.data ?? []) {
+  for (const r of summaryRows) {
     const s = r.status as ChequeStatus;
     const t = totals.get(s) ?? { count: 0, amount: 0 };
     t.count += 1;
@@ -48,10 +59,13 @@ export default async function ChequeReconciliationPage() {
     amount: stat("submitted").amount + stat("presented").amount,
   };
 
-  const queue = (queueRes.data ?? []) as Cheque[];
+  const queue = scopeToFirm((queueRes.data ?? []) as Cheque[], "payee_name", firm, firms);
   const toPresent = queue.filter((c) => c.status === "submitted");
   const awaitingOutcome = queue.filter((c) => c.status === "presented");
-  const accountRows = (accountsRes.data ?? []) as CompanyBankAccount[];
+  // Only this firm's own accounts may be presented to.
+  const accountRows = scopeToFirm(
+    (accountsRes.data ?? []) as CompanyBankAccount[], "payee", firm, firms
+  );
   const accounts: PresentAccount[] = accountRows.map((a) => ({
     id: a.id, label: a.label, bank_name: a.bank_name, account_number: a.account_number, ifsc: a.ifsc,
   }));
@@ -87,7 +101,9 @@ export default async function ChequeReconciliationPage() {
     id: c.id, amount: c.amount, dealer_name: c.dealer_name, cheque_number: c.cheque_number,
     cheque_date: c.cheque_date, presented_date: c.presented_date, notes: c.notes,
   }));
-  const settledItems: SettledItem[] = ((settledRes.data ?? []) as Cheque[]).map((c) => ({
+  const settledItems: SettledItem[] = scopeToFirm(
+    (settledRes.data ?? []) as Cheque[], "payee_name", firm, firms
+  ).map((c) => ({
     id: c.id, status: c.status, cheque_number: c.cheque_number, dealer_name: c.dealer_name,
     payee_name: c.payee_name, amount: c.amount, cheque_date: c.cheque_date,
     cleared_date: c.cleared_date, bounce_reason: c.bounce_reason,
@@ -97,7 +113,7 @@ export default async function ChequeReconciliationPage() {
     <div>
       <PageHeader
         title="Reconciliation"
-        subtitle="Present submitted cheques to the bank, then mark them passed or bounced. Outstanding = presented or awaiting presentation."
+        subtitle={`${firm.name} — present submitted cheques to the bank, then mark them passed or bounced. Outstanding = presented or awaiting presentation.`}
         actions={
           <a
             href="/cheques/export"
@@ -107,6 +123,8 @@ export default async function ChequeReconciliationPage() {
           </a>
         }
       />
+
+      <FirmBar firm={firm} firms={firms} />
 
       <Section title="Status">
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">

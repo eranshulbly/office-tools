@@ -1,48 +1,38 @@
-import { createServerClient, type CookieOptions } from "@supabase/ssr";
 import { NextResponse, type NextRequest } from "next/server";
-
-type CookieToSet = { name: string; value: string; options: CookieOptions };
+import { readToken, sessionCookie } from "@/lib/db/session";
 
 /**
- * Refreshes the Supabase auth session on every request and redirects
- * unauthenticated users to /login. Route guards are cosmetic (RLS is the real
- * gate), but this keeps the session cookie fresh and the UX sane.
+ * Gate unauthenticated requests, redirecting to /login.
+ *
+ * The Supabase version made a network call to refresh the session on EVERY
+ * request. Sessions are now self-contained signed tokens, so this verifies the
+ * cookie locally — no database or network round trip in the hot path.
+ *
+ * This is a UX guard only. It checks that a session token is valid and
+ * unexpired; it does not know the user's role. Authorization lives in the data
+ * layer (src/lib/db/authz.ts) — reaching a page is not permission to see what
+ * is on it.
  */
 export async function updateSession(request: NextRequest) {
-  let response = NextResponse.next({ request });
-
-  const supabase = createServerClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
-    {
-      cookies: {
-        getAll() {
-          return request.cookies.getAll();
-        },
-        setAll(cookiesToSet: CookieToSet[]) {
-          cookiesToSet.forEach(({ name, value }) => request.cookies.set(name, value));
-          response = NextResponse.next({ request });
-          cookiesToSet.forEach(({ name, value, options }) =>
-            response.cookies.set(name, value, options)
-          );
-        },
-      },
-    }
-  );
-
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-
   const path = request.nextUrl.pathname;
   const isPublic = path.startsWith("/login") || path.startsWith("/auth");
 
-  if (!user && !isPublic) {
+  const userId = readToken(request.cookies.get(sessionCookie.name)?.value);
+
+  if (!userId && !isPublic) {
     const redirectUrl = request.nextUrl.clone();
     redirectUrl.pathname = "/login";
     redirectUrl.searchParams.set("next", path);
     return NextResponse.redirect(redirectUrl);
   }
 
-  return response;
+  // Already signed in and sitting on /login — send them into the app.
+  if (userId && path.startsWith("/login")) {
+    const redirectUrl = request.nextUrl.clone();
+    redirectUrl.pathname = "/";
+    redirectUrl.search = "";
+    return NextResponse.redirect(redirectUrl);
+  }
+
+  return NextResponse.next({ request });
 }

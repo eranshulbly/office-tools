@@ -1,35 +1,25 @@
-import { createServerClient, type CookieOptions } from "@supabase/ssr";
-import { cookies } from "next/headers";
-
-type CookieToSet = { name: string; value: string; options: CookieOptions };
+import { createDbClient, createDbServiceClient, type DbClient } from "@/lib/db/client";
 
 /**
- * Server-side Supabase client bound to the request cookies. Every query runs as
- * the logged-in user, so RLS applies. This is the ONLY client used for data
- * access in server components and server actions.
+ * MySQL-backed replacement for the Supabase server client.
+ *
+ * The name is kept so the 52 files that import it keep working; only the
+ * implementation changed. Once every call site has been reviewed against MySQL
+ * this should be renamed to something honest like `createDbClient` — until
+ * then, a rename would just add churn to a migration that already touches a lot.
+ *
+ * IMPORTANT — what changed underneath:
+ * Postgres RLS used to be the real authorization boundary; every query ran as
+ * the logged-in user and the database filtered rows. MySQL has no equivalent,
+ * so a query issued through this client is NOT filtered by role. Permission
+ * checks now have to be explicit in the calling code. Treat anything reading
+ * salaries, advances or payroll as unguarded until it has been given one.
  */
-export async function createSupabaseServerClient() {
-  const cookieStore = await cookies();
+export async function createSupabaseServerClient(): Promise<DbClient> {
+  return createDbClient();
+}
 
-  return createServerClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
-    {
-      cookies: {
-        getAll() {
-          return cookieStore.getAll();
-        },
-        setAll(cookiesToSet: CookieToSet[]) {
-          try {
-            cookiesToSet.forEach(({ name, value, options }) =>
-              cookieStore.set(name, value, options)
-            );
-          } catch {
-            // Called from a Server Component where cookies are read-only.
-            // Session refresh is handled in middleware, so this is safe to ignore.
-          }
-        },
-      },
-    }
-  );
+/** Formerly the service-role client; bypasses no RLS because there is none. */
+export function createSupabaseServiceClient(): DbClient {
+  return createDbServiceClient();
 }

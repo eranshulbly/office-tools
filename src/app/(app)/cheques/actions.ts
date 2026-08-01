@@ -4,6 +4,7 @@ import { revalidatePath } from "next/cache";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { getProfile } from "@/lib/auth";
 import { amountToWords, chequeIdentityKeys } from "@/lib/cheque";
+import { requireFirm, getActiveFirm } from "@/lib/firm";
 import type { ChequeFields } from "@/lib/types";
 
 export type ChequeActionState = { error?: string; ok?: boolean; count?: number };
@@ -269,6 +270,11 @@ export async function createCheques(
     for (const k of keys) batchKeys.add(k);
   }
 
+  // Every new cheque is filed under the firm you are working in. The payee is
+  // what makes a cheque belong to a firm, so an unset payee here would create a
+  // cheque that shows up in every firm's books — see belongsToFirm.
+  const firm = await requireFirm();
+
   let count = 0;
   for (const raw of rows) {
     const fields = clean(raw);
@@ -277,6 +283,8 @@ export async function createCheques(
       const words = amountToWords(fields.amount);
       if (words) fields.amount_in_words = words;
     }
+    // Trust the selected firm over whatever OCR/AI read off the cheque image.
+    fields.payee_name = firm.name;
     const { data: id, error } = await supabase.rpc("create_cheque", { p: fields });
     if (error) return { error: error.message, count };
     if (submit && id) {
@@ -373,12 +381,18 @@ export async function saveBankAccount(
   const label = String(formData.get("label") ?? "").trim();
   if (!label) return { error: "A label is required." };
   const supabase = await createSupabaseServerClient();
+  // Payee IS the firm, so a new account defaults to the firm you are working
+  // in. An explicit payee on the form still wins — that is how you create the
+  // first account for a brand-new firm.
+  const firm = await getActiveFirm();
+  const payee = String(formData.get("payee") ?? "").trim() || firm?.name || null;
+
   const { error } = await supabase.from("company_bank_accounts").insert({
     label,
     bank_name: String(formData.get("bank_name") ?? "").trim() || null,
     account_number: String(formData.get("account_number") ?? "").trim() || null,
     ifsc: String(formData.get("ifsc") ?? "").trim() || null,
-    payee: String(formData.get("payee") ?? "").trim() || null,
+    payee,
   });
   if (error) return { error: error.message };
   revalidatePath("/cheques/bank-accounts");

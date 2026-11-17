@@ -19,7 +19,7 @@ const TIME_RE = /^([01]?\d|2[0-3]):[0-5]\d(:[0-5]\d)?$/;
  */
 function validateSetting(key: string, value: SettingValue): string | null {
   // Keys that must be a valid HH:MM(:SS) time.
-  if (key === "late_first_punch_cutoff") {
+  if (key === "late_first_punch_cutoff" || key === "punch_in_only_default_out") {
     if (typeof value !== "string" || !TIME_RE.test(value.trim())) {
       return "Cutoff must be a time in HH:MM (24-hour) format, e.g. 22:00.";
     }

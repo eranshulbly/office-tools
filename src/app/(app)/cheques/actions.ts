@@ -9,6 +9,43 @@ import type { ChequeFields } from "@/lib/types";
 
 export type ChequeActionState = { error?: string; ok?: boolean; count?: number };
 
+/**
+ * Identity keys of every cheque already in the system that should block a
+ * re-upload — i.e. anything not bounced. A bounced cheque may legitimately be
+ * presented again, so it does not block.
+ *
+ * Shared by the save guard and the live check the upload screen runs, so the
+ * two can never disagree about what counts as a duplicate.
+ */
+async function existingIdentityKeys(): Promise<Set<string>> {
+  const supabase = await createSupabaseServerClient();
+  const { data } = await supabase
+    .from("cheques")
+    .select("cheque_number, account_number, ifsc, micr_code")
+    .neq("status", "bounced");
+  const set = new Set<string>();
+  for (const c of data ?? []) for (const k of chequeIdentityKeys(c)) set.add(k);
+  return set;
+}
+
+/**
+ * Which of these cheques already exist in the system? Returns their positions.
+ *
+ * Called by the upload screen as soon as extraction finishes, so duplicates are
+ * flagged before the user commits rather than after — the save guard still runs
+ * server-side regardless, since a client check is a convenience, not a control.
+ */
+export async function findKnownDuplicates(list: ChequeFields[]): Promise<number[]> {
+  if (!Array.isArray(list) || list.length === 0) return [];
+  const existing = await existingIdentityKeys();
+  const hits: number[] = [];
+  list.forEach((f, i) => {
+    const keys = chequeIdentityKeys(clean(f));
+    if (keys.length && keys.some((k) => existing.has(k))) hits.push(i);
+  });
+  return hits;
+}
+
 // ── AI extraction via the S9 LLM gateway (Gemini vision) ─────────────────────
 // The gateway runs as a localhost Python sidecar; POST /v1/vision returns a
 // schema-validated `parsed` object. The image is passed through transiently and
@@ -239,6 +276,7 @@ export async function createCheques(
 ): Promise<ChequeActionState> {
   if (!Array.isArray(rows) || rows.length === 0) return { error: "Nothing to save." };
   const supabase = await createSupabaseServerClient();
+  void supabase;
 
   // ── Duplicate guard (identity = IFSC/MICR + account + cheque number) ──
   // Block a cheque that already exists in the system in any NON-bounced state
@@ -249,12 +287,7 @@ export async function createCheques(
   const label = (f: Record<string, string>) =>
     `#${f.cheque_number || "?"}${f.account_number ? ` (a/c ${f.account_number})` : ""}`;
 
-  const { data: existing } = await supabase
-    .from("cheques")
-    .select("cheque_number, account_number, ifsc, micr_code")
-    .neq("status", "bounced");
-  const existingKeys = new Set<string>();
-  for (const c of existing ?? []) for (const k of chequeIdentityKeys(c)) existingKeys.add(k);
+  const existingKeys = await existingIdentityKeys();
 
   const batchKeys = new Set<string>();
   for (const f of cleaned) {
@@ -362,12 +395,17 @@ export async function recordPresented(
   return { ok: true };
 }
 
+/**
+ * The settlement date is deliberately not a parameter: a null p_date makes the
+ * RPC stamp cleared_date itself, in the warehouse timezone, so it cannot be set
+ * from a client clock or a stale rendered page.
+ */
 export async function markOutcome(
-  id: string, passed: boolean, date: string, reason: string
+  id: string, passed: boolean, reason: string
 ): Promise<ChequeActionState> {
   const supabase = await createSupabaseServerClient();
   const { error } = await supabase.rpc("mark_cheque_outcome", {
-    p_id: id, p_passed: passed, p_date: date || null, p_reason: reason.trim(),
+    p_id: id, p_passed: passed, p_date: null, p_reason: reason.trim(),
   });
   if (error) return { error: error.message };
   revalidate();

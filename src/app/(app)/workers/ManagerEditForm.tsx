@@ -78,7 +78,6 @@ export function ManagerEditForm({
           <input
             name="full_name"
             type="text"
-            required
             pattern="[A-Za-z][A-Za-z .'-]{1,}"
             title="Letters, spaces, and . ' - only (no digits)."
             defaultValue={worker.full_name}
@@ -87,10 +86,10 @@ export function ManagerEditForm({
         </Field>
 
         <Field label="Group">
-          <select name="group_id" required defaultValue={worker.group_id ?? ""} className={inputClass}>
-            <option value="" disabled>
-              — select a group —
-            </option>
+          <select name="group_id" defaultValue={worker.group_id ?? ""} className={inputClass}>
+            {/* Selectable, not disabled: most of the roster has no group, and
+                leaving it unset has to stay a valid answer. */}
+            <option value="">— no group —</option>
             {groups.map((g) => (
               <option key={g.id} value={g.id}>
                 {g.name}
@@ -103,7 +102,6 @@ export function ManagerEditForm({
           <input
             name="phone"
             type="tel"
-            required
             pattern="(\+?91[- ]?)?[6-9][0-9]{9}"
             title="10-digit Indian mobile number (optionally with +91)."
             defaultValue={worker.phone ?? ""}
@@ -115,7 +113,6 @@ export function ManagerEditForm({
           <input
             name="joined_on"
             type="date"
-            required
             max={todayStr}
             defaultValue={worker.joined_on}
             className={inputClass}

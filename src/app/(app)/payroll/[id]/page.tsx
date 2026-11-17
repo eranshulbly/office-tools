@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { requireRole } from "@/lib/auth";
+import { requireFeature } from "@/lib/auth";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import {
   PageHeader,
@@ -92,7 +92,7 @@ export default async function RunDetailPage({
 }: {
   params: Promise<{ id: string }>;
 }) {
-  await requireRole("admin");
+  await requireFeature("payroll");
   const { id } = await params;
   const supabase = await createSupabaseServerClient();
 
@@ -109,7 +109,7 @@ export default async function RunDetailPage({
   const { data: lineData } = await supabase
     .from("payroll_lines")
     .select(
-      "id, worker_id, salary_snapshot, daily_rate_snapshot, full_days, half_days, absent_days, extra_days, leave_units, net, pay_mode, paid_at, payment_reference, workers(full_name, employee_code, photo_path), payroll_line_components(id, code, label, type, amount)"
+      "id, worker_id, salary_snapshot, daily_rate_snapshot, full_days, half_days, absent_days, extra_days, leave_units, net, pay_mode, paid_at, payment_reference, workers(full_name, employee_code, designation, photo_path), payroll_line_components(id, code, label, type, amount)"
     )
     .eq("run_id", id);
 
@@ -127,14 +127,14 @@ export default async function RunDetailPage({
     const [{ data: uData }, { data: pData }] = await Promise.all([
       supabase
         .from("attendance_days")
-        .select("worker_id, day, status, workers(full_name, employee_code)")
+        .select("worker_id, day, status, workers(full_name, employee_code, designation)")
         .in("status", ["unresolved", "late_review"])
         .gte("day", run.period_start)
         .lte("day", run.period_end)
         .order("day"),
       supabase
         .from("adjustments")
-        .select("id, worker_id, day, reason, workers(full_name, employee_code)")
+        .select("id, worker_id, day, reason, workers(full_name, employee_code, designation)")
         .eq("status", "pending")
         .gte("day", run.period_start)
         .lte("day", run.period_end)

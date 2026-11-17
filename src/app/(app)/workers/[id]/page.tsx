@@ -1,5 +1,5 @@
 import { notFound } from "next/navigation";
-import { requireRole, requireSuiteAccess } from "@/lib/auth";
+import { requireFeature, requireSuiteAccess } from "@/lib/auth";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { PageHeader, LinkButton, Card, Badge, Section } from "@/components/ui";
 import { signedPhotoUrl, signedIdProofUrl } from "@/lib/storage";
@@ -59,16 +59,31 @@ export default async function EditWorkerPage({
 }: {
   params: Promise<{ id: string }>;
 }) {
-  const profile = await requireRole("admin", "manager");
+  const profile = await requireFeature("workers");
   requireSuiteAccess(profile, "hr");
   const { id } = await params;
   const supabase = await createSupabaseServerClient();
 
-  if (profile.role === "manager") {
+  // Non-admins get the propose-an-edit view. Tested as "not admin" rather than
+  // "is manager": the old check let ops_manager_hr fall through to the admin
+  // form, which shows salary, bank details and the ID proof.
+  if (profile.role !== "admin") {
     // Manager: they may only propose edits to workers in their own groups, but
     // may re-assign to ANY group (the target dropdown lists every group).
+    //
+    // Columns are named rather than "*" because `worker` is handed to a CLIENT
+    // component below — anything selected here is serialised into the page
+    // payload, whether or not a field renders it. The builder also withholds
+    // salary from non-admins, so this is belt and braces on the same leak.
     const [{ data: workerData }, { data: mga }, { data: allGroupData }, { data: myReqData }] = await Promise.all([
-      supabase.from("workers").select("*").eq("id", id).single(),
+      supabase
+        .from("workers")
+        .select(
+          "id, employee_code, full_name, designation, phone, group_id, joined_on, " +
+            "left_on, is_active, photo_path, approval_status"
+        )
+        .eq("id", id)
+        .single(),
       supabase
         .from("manager_group_access")
         .select("group_id")
@@ -86,10 +101,14 @@ export default async function EditWorkerPage({
     if (!workerData) notFound();
     const worker = workerData as Worker;
 
-    // Guard (which workers are editable): the manager's own groups.
-    const ownGroupIds = new Set((mga ?? []).map((r) => r.group_id as string));
-    if (!worker.group_id || !ownGroupIds.has(worker.group_id)) {
-      notFound();
+    // Guard (which workers are editable): the manager's own groups. An HR ops
+    // manager is not group-scoped — HR covers the whole roster — so the group
+    // check does not apply to them. It still does to a manager.
+    if (profile.role !== "ops_manager_hr") {
+      const ownGroupIds = new Set((mga ?? []).map((r) => r.group_id as string));
+      if (!worker.group_id || !ownGroupIds.has(worker.group_id)) {
+        notFound();
+      }
     }
 
     // Dropdown options: every group (a manager may propose any target group).

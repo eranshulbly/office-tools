@@ -1,6 +1,6 @@
 import express from "express";
 import { config } from "./config.js";
-import { parseAttlog, parseUserInfo } from "./parser.js";
+import { parseAttlog, parseUserInfo, parseFingerprints } from "./parser.js";
 import { Spool } from "./queue.js";
 import { startDrainer } from "./forwarder.js";
 import {
@@ -10,7 +10,10 @@ import {
   ensureDevice,
   touchDevice,
   upsertDeviceUsers,
-} from "./supabase.js";
+  clearDeviceUsers,
+  clearFingerprints,
+  upsertFingerprints,
+} from "./db.js";
 
 const spool = new Spool(config.spoolDir);
 const app = express();
@@ -65,12 +68,20 @@ app.post("/iclock/cdata", async (req, res) => {
   if (table !== "ATTLOG") {
     // The enrolled-user list arrives as "USER PIN=..\tName=..\t.." lines. Real
     // firmware sends them under OPERLOG (not USERINFO), so scan any non-ATTLOG
-    // push. "FP ..." lines are fingerprint templates — deliberately discarded,
-    // biometric data is never stored server-side.
+    // push.
     const users = parseUserInfo(String(req.body || ""));
     if (users.length) {
       console.log(`[server] USERINFO SN=${sn} ${users.length} user(s): ${users.map((u) => `${u.pin}=${u.name}`).join(", ")}`);
       upsertDeviceUsers(sn, users).catch((e) => console.error(`[server] device_users: ${e.message}`));
+    }
+
+    // "FP PIN=.. FID=.. Valid=.. TMP=<template>" — the TEMPLATE is dropped by the
+    // parser and never reaches here. Only the finger SLOT (FID) is kept, so an
+    // admin can verify everyone enrolled the finger they were asked to.
+    const fps = parseFingerprints(String(req.body || ""));
+    if (fps.length) {
+      console.log(`[server] FINGERPRINTS SN=${sn} ${fps.length} record(s)`);
+      upsertFingerprints(sn, fps).catch((e) => console.error(`[server] device_fingerprints: ${e.message}`));
     }
     return ok(res, "OK");
   }
@@ -124,6 +135,18 @@ app.post("/admin/cmd", (req, res) => {
   const sn = String(req.query.sn || "");
   const cmd = String(req.query.cmd || "DATA QUERY USERINFO");
   if (!sn) return res.status(400).json({ error: "sn required" });
+
+  // Re-reading the device's user list replaces our mirror rather than merging
+  // into it, so users deleted on the terminal actually disappear here too.
+  if (/^DATA\s+QUERY\s+USERINFO/i.test(cmd)) {
+    clearDeviceUsers(sn).catch(() => {});
+  }
+
+  // Same reasoning for the fingerprint mirror: re-read it, never merge into it.
+  if (/^DATA\s+QUERY\s+FINGERTMP/i.test(cmd)) {
+    clearFingerprints(sn).catch(() => {});
+  }
+
   const id = queueCommand(sn, cmd);
   res.json({ queued: true, id, sn, cmd });
 });

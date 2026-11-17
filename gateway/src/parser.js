@@ -57,3 +57,42 @@ export function parseUserInfo(body) {
   }
   return out;
 }
+
+/**
+ * Parse fingerprint METADATA from an "FP PIN=..." push.
+ *
+ *   FP PIN=12\tFID=6\tSize=1404\tValid=1\tTMP=<base64 template>
+ *
+ * Only PIN, FID and Valid are taken. The TMP field is the biometric template
+ * and is never read, logged or stored — FID is just the slot the enroller
+ * chose, which is ordinary metadata.
+ *
+ * ZKTeco finger indices:
+ *   0 left little · 1 left ring · 2 left middle · 3 left index · 4 left thumb
+ *   5 right thumb · 6 right index · 7 right middle · 8 right ring · 9 right little
+ */
+export const FINGER_NAMES = [
+  "Left little", "Left ring", "Left middle", "Left index", "Left thumb",
+  "Right thumb", "Right index", "Right middle", "Right ring", "Right little",
+];
+
+export function parseFingerprints(body) {
+  const out = [];
+  for (const rawLine of String(body || "").split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line.startsWith("FP ")) continue;
+    const fields = {};
+    for (const part of line.slice(3).split("\t")) {
+      const i = part.indexOf("=");
+      if (i <= 0) continue;
+      const key = part.slice(0, i).trim();
+      if (key === "TMP") continue; // never touch the template
+      fields[key] = part.slice(i + 1).trim();
+    }
+    const pin = parseInt(fields.PIN, 10);
+    const fid = parseInt(fields.FID, 10);
+    if (!Number.isInteger(pin) || pin <= 0 || !Number.isInteger(fid)) continue;
+    out.push({ pin, fid, valid: fields.Valid !== "0" });
+  }
+  return out;
+}

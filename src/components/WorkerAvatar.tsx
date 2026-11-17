@@ -55,20 +55,26 @@ export function WorkerAvatar({
 export function WorkerCell({
   name,
   code,
+  designation,
   url,
   size = "md",
 }: {
   name: string;
   code?: string;
+  /** Job title, shown under the name — "Picker Hero", "Supervisor Dispatch". */
+  designation?: string | null;
   url?: string | null;
   size?: keyof typeof SIZES;
 }) {
+  // Code and designation share the sub-line: on a roster of 92 people the title
+  // is what tells them apart, and two of them are called Vishal.
+  const sub = [code, designation?.trim()].filter(Boolean).join(" · ");
   return (
     <div className="flex items-center gap-2 min-w-0">
       <WorkerAvatar name={name} url={url} size={size} />
       <div className="min-w-0">
         <div className="font-medium text-ink truncate">{name}</div>
-        {code && <div className="text-muted text-xs">{code}</div>}
+        {sub && <div className="text-muted text-xs truncate">{sub}</div>}
       </div>
     </div>
   );

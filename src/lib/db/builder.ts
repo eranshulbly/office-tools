@@ -56,6 +56,9 @@ type Op = "select" | "insert" | "update" | "upsert" | "delete";
  */
 export type Guard = (table: string, op: Op) => Promise<string | null>;
 
+/** Columns this caller may not read, stripped from results. See authz.ts. */
+export type Redactor = (table: string) => Promise<readonly string[]>;
+
 /** Backtick-quote an identifier, rejecting anything that isn't a plain name. */
 function ident(name: string): string {
   const n = name.trim();
@@ -68,16 +71,44 @@ function ident(name: string): string {
 /**
  * Foreign keys behind PostgREST's embedded-resource syntax.
  *
- * Supabase resolved `select("*, workers(full_name)")` from the FK graph. MySQL
- * has the same constraints but no such query layer, so the three relations the
- * app actually embeds are declared here. Anything else raises rather than
- * quietly returning rows without the nested object.
+ * Supabase resolved `select("*, workers(full_name)")` from the database's own
+ * FK graph. This does the same: information_schema is read once and cached, so
+ * `profiles(full_name)` from audit_log resolves via actor_id, and from cheques
+ * via uploaded_by, with nothing to hand-maintain.
+ *
+ * A hardcoded table→column map was tried first and broke on every page it had
+ * not anticipated — profiles alone is referenced by a dozen different columns.
+ *
+ * Where a table has SEVERAL foreign keys to the same target the relation is
+ * genuinely ambiguous, and the caller must disambiguate with PostgREST's
+ * `alias:table!column(...)` form — exactly as Supabase required.
  */
-const RELATIONS: Record<string, { fk: string; pk: string }> = {
-  workers: { fk: "worker_id", pk: "id" },
-  worker_groups: { fk: "group_id", pk: "id" },
-  payroll_runs: { fk: "run_id", pk: "id" },
-};
+type Relation = { fk: string; pk: string };
+let fkGraph: Map<string, Relation[]> | null = null;
+
+async function loadFkGraph(): Promise<Map<string, Relation[]>> {
+  if (fkGraph) return fkGraph;
+  const [rows] = (await pool.query(
+    `SELECT TABLE_NAME AS src, COLUMN_NAME AS fk,
+            REFERENCED_TABLE_NAME AS dst, REFERENCED_COLUMN_NAME AS pk
+       FROM information_schema.KEY_COLUMN_USAGE
+      WHERE TABLE_SCHEMA = DATABASE() AND REFERENCED_TABLE_NAME IS NOT NULL`
+  )) as [RowDataPacket[], unknown];
+
+  const g = new Map<string, Relation[]>();
+  for (const r of rows as { src: string; fk: string; dst: string; pk: string }[]) {
+    const key = `${r.src}->${r.dst}`;
+    g.set(key, [...(g.get(key) ?? []), { fk: r.fk, pk: r.pk }]);
+  }
+  fkGraph = g;
+  return g;
+}
+
+/** Which column joins `from` to `to`? Null when absent or ambiguous. */
+async function resolveFk(from: string, to: string): Promise<Relation | null> {
+  const candidates = (await loadFkGraph()).get(`${from}->${to}`) ?? [];
+  return candidates.length === 1 ? candidates[0] : null;
+}
 
 type Embed = { key: string; table: string; cols: string; fk: string; pk: string };
 
@@ -108,12 +139,20 @@ function parseSelect(cols: string): { sql: string; embeds: Embed[] } {
     const part = raw.trim();
     if (!part) continue;
 
-    const rel = part.match(/^(?:([A-Za-z_][A-Za-z0-9_]*)\s*:\s*)?([A-Za-z_][A-Za-z0-9_]*)\s*\((.*)\)$/s);
+    // `alias:table(cols)` and PostgREST's explicit-FK form `alias:table!fk(cols)`.
+    //
+    // The `!fk` disambiguator matters for tables reachable by several columns —
+    // profiles is referenced by requested_by, decided_by, approved_by,
+    // uploaded_by and more, so a single mapping in RELATIONS cannot express it.
+    // When present, that column IS the answer and no lookup is needed.
+    const rel = part.match(
+      /^(?:([A-Za-z_][A-Za-z0-9_]*)\s*:\s*)?([A-Za-z_][A-Za-z0-9_]*)(?:!([A-Za-z_][A-Za-z0-9_]*))?\s*\((.*)\)$/s
+    );
     if (rel) {
-      const [, alias, table, inner] = rel;
-      const def = RELATIONS[table];
-      if (!def) throw new Error(`No relation mapping for embedded resource "${table}"`);
-      embeds.push({ key: alias || table, table, cols: inner, fk: def.fk, pk: def.pk });
+      const [, alias, table, fkHint, inner] = rel;
+      // fk may be empty here — it is resolved from the FK graph at fetch time,
+      // which needs a database round trip and so cannot happen in this sync pass.
+      embeds.push({ key: alias || table, table, cols: inner, fk: fkHint ?? "", pk: "id" });
       continue;
     }
 
@@ -122,12 +161,14 @@ function parseSelect(cols: string): { sql: string; embeds: Embed[] } {
     scalars.push(ident(part));
   }
 
-  // The FK must be selected so rows can be matched to their parent, even when
-  // the caller didn't ask for it. Stripped again after attaching.
+  // When the FK is known up front make sure it is selected, so rows can be
+  // matched to their parent even if the caller didn't ask for that column.
+  // Unhinted embeds fall back to "*" below, since the column is not known yet.
   for (const e of embeds) {
-    if (!scalars.some((s) => s.includes(`\`${e.fk}\``))) scalars.push(ident(e.fk));
+    if (e.fk && !scalars.some((s) => s.includes(`\`${e.fk}\``))) scalars.push(ident(e.fk));
   }
-  return { sql: scalars.length ? scalars.join(", ") : "*", embeds };
+  const needsAll = embeds.some((e) => !e.fk);
+  return { sql: needsAll ? "*" : scalars.length ? scalars.join(", ") : "*", embeds };
 }
 
 export class Query<
@@ -149,10 +190,12 @@ export class Query<
   private upsertKeys: string[] = [];
   private embeds: Embed[] = [];
   private guard?: Guard;
+  private redactor?: Redactor;
 
-  constructor(table: string, guard?: Guard) {
+  constructor(table: string, guard?: Guard, redactor?: Redactor) {
     this.table = table;
     this.guard = guard;
+    this.redactor = redactor;
   }
 
   // ── projection / mutation ──────────────────────────────────────────────
@@ -309,7 +352,8 @@ export class Query<
 
       const [rows] = (await pool.query(sql, w.params)) as [RowDataPacket[], unknown];
       const withEmbeds = await this.attachEmbeds(rows as Row[]);
-      return this.shape(withEmbeds, count);
+      const decorated = decorateNames(withEmbeds);
+      return this.shape(await this.applyRedaction(decorated), count);
     }
 
     if (this.op === "insert" || this.op === "upsert") {
@@ -380,10 +424,59 @@ export class Query<
    * One query per relation, not per row: a naive implementation here would fire
    * N+1 queries against a shared db.t4g.micro and exhaust its ~85 connections.
    */
+  /**
+   * Drop columns this caller may not read, from the rows AND from anything
+   * embedded in them.
+   *
+   * Embeds matter as much as the top level: `worker:workers(monthly_salary)`
+   * reaches the same column by another route, and a check that only covered
+   * the outer table would be trivially sidestepped by embedding.
+   *
+   * Deletion, not nulling — a null salary is a real state here (every imported
+   * employee has one), so blanking would be indistinguishable from the truth.
+   * An absent key reads as "this caller has no such column".
+   */
+  private async applyRedaction(rows: Row[]): Promise<Row[]> {
+    if (!this.redactor || !rows.length) return rows;
+
+    const strip = (row: Row, cols: readonly string[]) => {
+      for (const c of cols) delete row[c];
+    };
+
+    const own = await this.redactor(this.table);
+    if (own.length) for (const r of rows) strip(r, own);
+
+    for (const e of this.embeds) {
+      const cols = await this.redactor(e.table);
+      if (!cols.length) continue;
+      for (const r of rows) {
+        const v = r[e.key];
+        if (Array.isArray(v)) for (const x of v) strip(x as Row, cols);
+        else if (v && typeof v === "object") strip(v as Row, cols);
+      }
+    }
+    return rows;
+  }
+
   private async attachEmbeds(rows: Row[]): Promise<Row[]> {
     if (!this.embeds.length || !rows.length) return rows;
 
     for (const e of this.embeds) {
+      // Resolve the joining column from the database's FK graph when the caller
+      // didn't spell it out with `table!column(...)`.
+      if (!e.fk) {
+        const found = await resolveFk(this.table, e.table);
+        if (!found) {
+          throw new Error(
+            `Cannot embed "${e.table}" from "${this.table}": ` +
+              `no unique foreign key between them. ` +
+              `Disambiguate with ${e.key}:${e.table}!<column>(...).`
+          );
+        }
+        e.fk = found.fk;
+        e.pk = found.pk;
+      }
+
       const ids = [...new Set(rows.map((r) => r[e.fk]).filter((v) => v != null))];
       if (!ids.length) {
         for (const r of rows) r[e.key] = null;
@@ -453,6 +546,41 @@ export class Query<
       }))
       .then(onOk, onErr);
   }
+}
+
+/**
+ * Present an employee's name as "Name - Designation" everywhere.
+ *
+ * Applied centrally on the way out of the database, rather than at each of the
+ * dozens of places a name is rendered — that approach was tried and screens
+ * kept getting missed. Any query that selects both columns now shows the title
+ * automatically, including embedded `worker:workers(...)` resources.
+ *
+ * The untouched value is preserved as `full_name_only`. That matters: edit
+ * forms must pre-fill with the real name, or saving would write the combined
+ * string back and it would grow a second designation on the next render. The
+ * device push is unaffected because it reads through query(), not this builder.
+ */
+function withDesignation(row: Row): Row {
+  const name = row.full_name;
+  const role = row.designation;
+  if (typeof name !== "string") return row;
+  row.full_name_only = name;
+  if (typeof role === "string" && role.trim()) {
+    row.full_name = `${name} - ${role.trim()}`;
+  }
+  return row;
+}
+
+/** Decorate top-level rows and any embedded worker objects they carry. */
+function decorateNames(rows: Row[]): Row[] {
+  for (const r of rows) {
+    withDesignation(r);
+    for (const v of Object.values(r)) {
+      if (v && typeof v === "object" && !Array.isArray(v)) withDesignation(v as Row);
+    }
+  }
+  return rows;
 }
 
 /** Booleans and objects need coercing to what MySQL columns expect. */

@@ -1,22 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import { statusColor, statusView } from "@/lib/attendance-status";
 import { getWorkerAttendance, type WorkerAttendance } from "./actions";
-
-const STATUS_LABEL: Record<string, string> = {
-  full_day: "Full day",
-  absent: "Absent",
-  unresolved: "Unresolved",
-  not_working_day: "Not working",
-  late_review: "Late — review",
-};
-const STATUS_COLOR: Record<string, string> = {
-  full_day: "var(--color-ok)",
-  absent: "var(--color-warn)",
-  unresolved: "var(--color-danger)",
-  not_working_day: "var(--color-faint)",
-  late_review: "var(--color-danger)",
-};
 
 function monthStart(): string {
   const d = new Date();
@@ -31,10 +17,12 @@ export function WorkerSummaryButton({
   workerId,
   name,
   code,
+  designation,
 }: {
   workerId: string;
   name: string;
   code: string;
+  designation?: string | null;
 }) {
   const [open, setOpen] = useState(false);
   const [from, setFrom] = useState(monthStart());
@@ -87,7 +75,7 @@ export function WorkerSummaryButton({
             <div className="flex items-start justify-between gap-3 p-5 border-b border-line">
               <div>
                 <div className="text-lg font-semibold text-ink">{name}</div>
-                <div className="text-muted text-sm">{code} · attendance summary</div>
+                <div className="text-muted text-sm">{[code, designation].filter(Boolean).join(" · ")} · attendance summary</div>
               </div>
               <button
                 type="button"
@@ -153,8 +141,20 @@ export function WorkerSummaryButton({
                     <Stat label="Present" value={data.summary.present} tone="var(--color-ok)" />
                     <Stat label="Absent" value={data.summary.absent} tone="var(--color-warn)" />
                     <Stat label="Leave units" value={data.summary.leave_units} tone="var(--color-danger)" />
-                    <Stat label="Full days" value={data.summary.full_day} />
-                    <Stat label="Unresolved" value={data.summary.unresolved} tone="var(--color-danger)" />
+                    {data.summary.punched_in > 0 && (
+                      <Stat
+                        label="Punched in"
+                        value={data.summary.punched_in}
+                        tone="var(--color-brand)"
+                      />
+                    )}
+                    {data.summary.unresolved > 0 && (
+                      <Stat
+                        label="Unresolved"
+                        value={data.summary.unresolved}
+                        tone="var(--color-danger)"
+                      />
+                    )}
                     {data.summary.late_review > 0 && (
                       <Stat
                         label="Late — review"
@@ -182,9 +182,9 @@ export function WorkerSummaryButton({
                               )}
                               <span
                                 className="font-medium"
-                                style={{ color: STATUS_COLOR[r.status] ?? "var(--color-ink)" }}
+                                style={{ color: statusColor(r.status, r.day) }}
                               >
-                                {STATUS_LABEL[r.status] ?? r.status}
+                                {statusView(r.status, r.day).label}
                               </span>
                             </span>
                           </div>

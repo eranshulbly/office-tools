@@ -61,21 +61,28 @@ export const SUITES: Suite[] = [
     icon: "📲",
     accent: "amber",
   },
+  {
+    key: "interview",
+    title: "Interviews",
+    description: "Capture candidates and their resumes, shortlist or reject.",
+    icon: "🧑‍💼",
+    accent: "violet",
+  },
 ];
 
 export const FEATURES: Feature[] = [
   // ── HR System ──
-  { key: "dashboard", title: "Overview", description: "Today's punches, device health, exceptions.", href: "/dashboard", icon: "📊", roles: ["admin", "manager"], suites: ["hr"] },
+  { key: "dashboard", title: "Overview", description: "Today's punches, device health, exceptions.", href: "/dashboard", icon: "📊", roles: ["admin", "manager", "ops_manager_hr"], suites: ["hr"] },
   { key: "attendance", title: "Attendance", description: "Daily grid by employee, raw punches, recompute.", href: "/attendance", icon: "🕔", roles: ["admin"], suites: ["hr"] },
   { key: "calendar", title: "Work calendar", description: "Working / closed / extra / swapped days.", href: "/calendar", icon: "🗓️", roles: ["admin"], suites: ["hr"] },
-  { key: "adjustments", title: "Adjustments", description: "Request a forgot-punch correction.", href: "/adjustments", icon: "✏️", roles: ["manager"], suites: ["hr"] },
-  { key: "workers", title: "Employees", description: "People, PINs, salary, photos & ID proof.", href: "/workers", icon: "👷", roles: ["admin", "manager"], suites: ["hr"] },
+  { key: "adjustments", title: "Adjustments", description: "Request a forgot-punch correction.", href: "/adjustments", icon: "✏️", roles: ["manager", "ops_manager_hr"], suites: ["hr"] },
+  { key: "workers", title: "Employees", description: "People, PINs, salary, photos & ID proof.", href: "/workers", icon: "👷", roles: ["admin", "manager", "ops_manager_hr"], suites: ["hr"] },
   { key: "device-pins", title: "Device PINs", description: "Map employees to the attendance terminal's User IDs.", href: "/workers/pins", icon: "🔢", roles: ["admin"], suites: ["hr"] },
   { key: "approvals", title: "Approvals", description: "Adjustment requests and after-10 PM late arrivals.", href: "/approvals", icon: "✅", roles: ["admin"], suites: ["hr"] },
   { key: "groups", title: "Employee groups", description: "Define groups and assign employees.", href: "/groups", icon: "🏷️", roles: ["admin"], suites: ["hr"] },
   { key: "managers", title: "Managers", description: "Create managers and set which groups they disburse.", href: "/managers", icon: "🧑‍💼", roles: ["admin"], suites: ["hr"] },
   { key: "settings", title: "Settings", description: "All business-rule thresholds.", href: "/settings", icon: "⚙️", roles: ["admin"], suites: ["hr"] },
-  { key: "audit", title: "Audit log", description: "Every decision, filterable.", href: "/audit", icon: "📜", roles: ["admin"], suites: ["hr"] },
+  { key: "audit", title: "Punch log", description: "Every fingerprint read, filterable.", href: "/audit", icon: "📜", roles: ["admin"], suites: ["hr"] },
 
   // ── Payroll ──
   { key: "payroll", title: "Salary runs", description: "Compute, approve, per-employee breakdown, reconcile.", href: "/payroll", icon: "🧾", roles: ["admin"], suites: ["payroll"] },
@@ -85,14 +92,19 @@ export const FEATURES: Feature[] = [
   { key: "statements", title: "Employee ledger", description: "Per-employee salary & advance transactions with running balance.", href: "/statements", icon: "📒", roles: ["admin"], suites: ["payroll"] },
 
   // ── Cheque Reconciliation ──
-  { key: "cheques", title: "Cheques", description: "Upload/enter dealer cheques and track their status.", href: "/cheques", icon: "🧾", roles: ["admin", "manager"], suites: ["cheque"] },
-  { key: "cheque-recon", title: "Reconciliation", description: "Present to bank, mark passed/bounced, status dashboard.", href: "/cheques/reconciliation", icon: "🏦", roles: ["admin"], suites: ["cheque"] },
+  { key: "cheques", title: "Cheques", description: "Upload/enter dealer cheques and track their status.", href: "/cheques", icon: "🧾", roles: ["admin", "manager", "ops_manager"], suites: ["cheque"] },
+  // ops_manager reaches this tab, but sees only the "to present" queue — no
+  // totals, no outcomes, no settled list. Enforced in the page, not just hidden.
+  { key: "cheque-recon", title: "Reconciliation", description: "Present to bank, mark passed/bounced, status dashboard.", href: "/cheques/reconciliation", icon: "🏦", roles: ["admin", "ops_manager"], suites: ["cheque"] },
   { key: "cheque-ledger", title: "Auto-reconcile (ledger)", description: "Upload a bank statement to auto-mark cheques passed or bounced.", href: "/cheques/ledger", icon: "📥", roles: ["admin"], suites: ["cheque"] },
   { key: "cheque-banks", title: "Bank accounts", description: "Manage your own bank accounts cheques are presented to.", href: "/cheques/bank-accounts", icon: "🏛️", roles: ["admin"], suites: ["cheque"] },
 
   // ── UPI Reconciliation (admin only) ──
   { key: "upi-reconcile", title: "Reconcile statement", description: "Upload a bank statement and label transactions by dealer.", href: "/upi/reconcile", icon: "📄", roles: ["admin"], suites: ["upi"] },
   { key: "upi-mappings", title: "Dealer UPI IDs", description: "Map each dealer's UPI ID to their name.", href: "/upi", icon: "🔗", roles: ["admin"], suites: ["upi"] },
+
+  // ── Interviews ──
+  { key: "candidates", title: "Candidates", description: "Add candidates with their resume, shortlist or reject.", href: "/interviews", icon: "🧑‍💼", roles: ["admin", "manager"], suites: ["interview"] },
 ];
 
 export const ACCENT: Record<Accent, { fg: string; soft: string }> = {
@@ -106,9 +118,21 @@ export const ACCENT: Record<Accent, { fg: string; soft: string }> = {
 // access sees these as "coming soon" (Cheque-only); admins always have access.
 export const GATED_SUITES = ["hr", "payroll"];
 
+/**
+ * Roles whose scope IS the role, rather than a per-user flag.
+ *
+ * ops_manager exists to bank cheques; ops_manager_hr exists to run HR. Their
+ * one suite must not be gated behind `full_access`, or the account would be
+ * locked out of the only thing it is for — and it would depend on whoever
+ * created the user remembering to tick a box. That is exactly how ops_manager
+ * got a visible tile it could not open.
+ */
+const SCOPED_ROLES: Role[] = ["ops_manager", "ops_manager_hr"];
+
 /** Is a suite "coming soon" for this user (global flag, or gated + no access)? */
 export function suiteComingSoon(suite: Suite, role: Role, fullAccess: boolean): boolean {
   if (suite.comingSoon) return true;
+  if (SCOPED_ROLES.includes(role)) return false;
   if (GATED_SUITES.includes(suite.key) && role !== "admin" && !fullAccess) return true;
   return false;
 }
@@ -129,8 +153,17 @@ export function firstFeatureHref(suiteKey: string, role: Role, fullAccess = fals
   return features[0]?.href ?? `/s/${suiteKey}`;
 }
 
-/** Suites visible to a user: any with ≥1 feature for them, plus "coming soon" ones. */
+/**
+ * Suites visible to a user: any with ≥1 feature for them, plus "coming soon" ones.
+ *
+ * The scoped roles are the exception — they see ONLY suites they can actually
+ * use. Showing a locked "HR / Payroll — coming soon" tile to someone whose
+ * whole job is banking cheques is noise that implies access they never get.
+ */
 export function suitesForRole(role: Role, fullAccess = false): Suite[] {
+  if (SCOPED_ROLES.includes(role)) {
+    return SUITES.filter((s) => featuresForSuite(s.key, role, fullAccess).length > 0);
+  }
   return SUITES.filter(
     (s) => suiteComingSoon(s, role, fullAccess) || featuresForSuite(s.key, role, fullAccess).length > 0
   );

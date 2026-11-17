@@ -1,4 +1,4 @@
-import { requireRole } from "@/lib/auth";
+import { requireFeature } from "@/lib/auth";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { PageHeader, Section, Card, Table, Th, Td, Badge, Button, Empty } from "@/components/ui";
 import { WorkerAvatar, WorkerCell } from "@/components/WorkerAvatar";
@@ -139,7 +139,7 @@ function fmtEditValue(
 }
 
 export default async function ApprovalsPage() {
-  await requireRole("admin");
+  await requireFeature("approvals");
   const supabase = await createSupabaseServerClient();
 
   const { data: settingsRows } = await supabase
@@ -156,7 +156,7 @@ export default async function ApprovalsPage() {
     .from("adjustments")
     .select(
       "id, worker_id, day, proposed_in, proposed_out, reason, requested_at, " +
-        "worker:workers(full_name, employee_code, photo_path), " +
+        "worker:workers(full_name, employee_code, designation, photo_path), " +
         "requester:profiles!requested_by(full_name)"
     )
     .eq("status", "pending")
@@ -183,7 +183,7 @@ export default async function ApprovalsPage() {
   // Held late-arrival days (after the 10 PM cutoff) — part of the same queue.
   const { data: lateData } = await supabase
     .from("attendance_days")
-    .select("worker_id, day, first_in, last_out, worked_hours, workers(full_name, employee_code, photo_path)")
+    .select("worker_id, day, first_in, last_out, worked_hours, workers(full_name, employee_code, designation, photo_path)")
     .eq("status", "late_review")
     .order("day")
     .order("worker_id");
@@ -193,7 +193,7 @@ export default async function ApprovalsPage() {
   const { data: newWorkerData, error: newWorkerError } = await supabase
     .from("workers")
     .select(
-      "id, full_name, employee_code, device_user_id, phone, joined_on, photo_path, id_proof_path, group_id, " +
+      "id, full_name, employee_code, designation, device_user_id, phone, joined_on, photo_path, id_proof_path, group_id, " +
         "worker_groups(name)"
     )
     .eq("approval_status", "pending")

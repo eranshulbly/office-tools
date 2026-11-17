@@ -1,10 +1,12 @@
 import type { ReactNode } from "react";
-import { requireRole } from "@/lib/auth";
+import { requireFeature } from "@/lib/auth";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import type { Profile } from "@/lib/types";
 import { PageHeader, Card, Section, LinkButton, Table, Th, Td, Badge, Empty } from "@/components/ui";
 import { WorkerAvatar } from "@/components/WorkerAvatar";
 import { signedPhotoUrlMap } from "@/lib/storage";
+import { query } from "@/lib/db/pool";
+import { warehouseToday } from "@/lib/attendance-status";
 
 type SupabaseServer = Awaited<ReturnType<typeof createSupabaseServerClient>>;
 
@@ -111,13 +113,17 @@ async function AdminDashboard(supabase: SupabaseServer): Promise<ReactNode> {
     supabase.from("worker_edit_requests").select("*", { count: "exact", head: true }).eq("status", "pending"),
     supabase
       .from("attendance_days")
-      .select("worker_id, day, worker:workers(full_name, employee_code, photo_path)", { count: "exact" })
+      .select("worker_id, day, worker:workers(full_name, employee_code, designation, photo_path)", { count: "exact" })
       .eq("status", "unresolved")
+      // Bounded to finished days. An unresolved row on TODAY is just somebody
+      // who has clocked in and not yet left; counting those made the headline
+      // read "Unresolved days: 55 — payroll blocked" every single morning.
+      .lt("day", warehouseToday())
       .order("day", { ascending: false })
       .limit(25),
     supabase
       .from("adjustments")
-      .select("worker_id, worker:workers(full_name, employee_code, photo_path)")
+      .select("worker_id, worker:workers(full_name, employee_code, designation, photo_path)")
       .eq("status", "approved")
       .gte("day", period.start)
       .lte("day", period.end),
@@ -138,6 +144,20 @@ async function AdminDashboard(supabase: SupabaseServer): Promise<ReactNode> {
     is_active: boolean | null;
   };
   const devices = (devicesRes.data ?? []) as Device[];
+
+  /**
+   * Clock skew per terminal, from its latest punch. Raw SQL because this needs
+   * a per-device "most recent row" and a timestamp difference — neither of
+   * which the PostgREST-shaped query builder expresses.
+   */
+  const driftRows = await query<{ device_serial: string; drift_seconds: number }>(
+    `SELECT p.device_serial,
+            TIMESTAMPDIFF(SECOND, p.device_ts, p.server_ts) AS drift_seconds
+       FROM raw_punches p
+       JOIN (SELECT device_serial, MAX(id) AS id FROM raw_punches GROUP BY device_serial) latest
+         ON latest.id = p.id`
+  );
+  const driftRes = { data: driftRows };
 
   type WorkerRefShape = { full_name: string; employee_code: string; photo_path: string | null };
   type WorkerRef = WorkerRefShape | WorkerRefShape[] | null;
@@ -182,6 +202,17 @@ async function AdminDashboard(supabase: SupabaseServer): Promise<ReactNode> {
   const now = Date.now();
   const offlineMs = offlineHours * 60 * 60 * 1000;
   const driftMs = driftMinutes * 60 * 1000;
+
+  /**
+   * Per-device clock skew, taken from each terminal's most recent punch:
+   * |device_ts - server_ts|. Both timestamps describe the same event, so the
+   * difference is real drift rather than idle time. A device that has never
+   * punched simply has no reading and is not flagged.
+   */
+  const driftSecondsBySerial = new Map<string, number>();
+  for (const r of (driftRes.data ?? []) as { device_serial: string; drift_seconds: number }[]) {
+    driftSecondsBySerial.set(r.device_serial, Math.abs(Number(r.drift_seconds ?? 0)));
+  }
 
   return (
     <div>
@@ -249,11 +280,22 @@ async function AdminDashboard(supabase: SupabaseServer): Promise<ReactNode> {
             {devices.map((d) => {
               const lastSeen = d.last_seen_at ? new Date(d.last_seen_at).getTime() : null;
               const offline = lastSeen == null || now - lastSeen > offlineMs;
-              const drift =
-                d.last_device_time != null && d.last_seen_at != null
-                  ? Math.abs(new Date(d.last_device_time).getTime() - new Date(d.last_seen_at).getTime()) >
-                    driftMs
-                  : false;
+
+              /**
+               * Clock drift = the terminal's clock vs ours for the SAME event.
+               *
+               * Measured from the most recent punch: device_ts is what the
+               * terminal thought the time was, server_ts is when we stored it.
+               * The difference is genuine skew (plus a few seconds of upload
+               * latency), which is exactly the "+5:30 canary" the spec wants.
+               *
+               * This previously compared last_device_time against last_seen_at.
+               * Those describe DIFFERENT moments — last_device_time is frozen at
+               * the last punch while last_seen_at advances on every 10-second
+               * poll — so the gap was really "time since anyone punched", and
+               * every quiet period raised a false drift alert.
+               */
+              const drift = (driftSecondsBySerial.get(d.serial_number) ?? 0) * 1000 > driftMs;
               return (
                 <tr key={d.serial_number}>
                   <Td className="font-medium">{d.label}</Td>
@@ -267,7 +309,11 @@ async function AdminDashboard(supabase: SupabaseServer): Promise<ReactNode> {
                   <Td>
                     <div className="flex flex-wrap gap-1">
                       {offline ? <Badge tone="danger">Offline</Badge> : <Badge tone="ok">Online</Badge>}
-                      {drift && <Badge tone="warn">Clock drift</Badge>}
+                      {drift && (
+                        <span title={`Terminal clock was ${driftSecondsBySerial.get(d.serial_number)}s off server time on its last punch`}>
+                          <Badge tone="warn">Clock drift</Badge>
+                        </span>
+                      )}
                     </div>
                   </Td>
                 </tr>
@@ -276,8 +322,9 @@ async function AdminDashboard(supabase: SupabaseServer): Promise<ReactNode> {
           </Table>
         )}
         <p className="mt-2 text-xs text-muted">
-          Offline if last check-in is older than {offlineHours}h. Clock drift if device time and server
-          time diverge beyond {driftMinutes} min (§9 canary).
+          Offline if last check-in is older than {offlineHours}h. Clock drift compares the terminal&apos;s
+          own clock against ours on its most recent punch, flagging a gap beyond {driftMinutes} min
+          (§9 canary). A few seconds of difference is normal upload latency.
         </p>
       </Section>
 
@@ -447,7 +494,7 @@ async function ManagerDashboard(supabase: SupabaseServer): Promise<ReactNode> {
 // ---- page ------------------------------------------------------------------
 
 export default async function DashboardPage() {
-  const profile: Profile = await requireRole("admin", "manager");
+  const profile: Profile = await requireFeature("dashboard");
   const supabase = await createSupabaseServerClient();
 
   const isAdmin = profile.role === "admin";

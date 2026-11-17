@@ -1,4 +1,4 @@
-import { requireRole } from "@/lib/auth";
+import { requireFeature } from "@/lib/auth";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import {
   PageHeader, Card, Section, Badge, Table, Th, Td, Empty, money,
@@ -18,7 +18,7 @@ export default async function StatementsPage({
 }: {
   searchParams: Promise<{ worker?: string }>;
 }) {
-  await requireRole("admin");
+  await requireFeature("statements");
   const { worker: workerId } = await searchParams;
   const supabase = await createSupabaseServerClient();
 

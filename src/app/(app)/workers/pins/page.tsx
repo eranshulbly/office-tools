@@ -1,4 +1,4 @@
-import { requireRole } from "@/lib/auth";
+import { requireFeature } from "@/lib/auth";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import type { Worker } from "@/lib/types";
 import { PageHeader, LinkButton } from "@/components/ui";
@@ -7,7 +7,7 @@ import { DevicePins, type PinWorker, type UnlinkedPin, type DeviceUser } from ".
 export const dynamic = "force-dynamic";
 
 export default async function DevicePinsPage() {
-  await requireRole("admin");
+  await requireFeature("device-pins");
   const supabase = await createSupabaseServerClient();
 
   const [workersRes, unlinkedRes, deviceUsersRes, devicesRes] = await Promise.all([

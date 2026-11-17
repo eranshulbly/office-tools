@@ -1,110 +1,96 @@
 /**
- * seed.ts — create the admin + manager auth users and their profiles, plus a
- * little sample data (devices, workers) so the app is usable immediately.
+ * seed.ts — create the admin + manager accounts on a fresh MySQL database.
  *
  *   npm run db:seed
  *
- * Idempotent-ish: re-running finds existing users by email and reuses them.
- * Uses the service_role key (bypasses RLS) — server-only, never shipped.
+ * Idempotent: re-running updates the existing accounts' password and role
+ * rather than failing on the unique email.
+ *
+ * Ported from the Supabase version, which used the service_role key to call
+ * auth.admin.createUser. The app owns its own auth table now, so accounts are
+ * written directly — auth_users + profiles together, in a transaction.
  */
 import { config } from "dotenv";
-import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+import mysql from "mysql2/promise";
+import bcrypt from "bcryptjs";
+import { randomUUID } from "crypto";
 
 config({ path: ".env.local" });
 
-const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-
-if (!url || !serviceKey) {
-  console.error("Set NEXT_PUBLIC_SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in .env.local");
+const url = process.env.DATABASE_URL;
+if (!url) {
+  console.error("DATABASE_URL is not set. Fill it in .env.local (mysql://user:pass@host:3306/db).");
+  process.exit(1);
+}
+// Guard against being pointed at the retired Postgres URL by accident.
+if (!url.startsWith("mysql://")) {
+  console.error(`DATABASE_URL is not a MySQL URL (got "${url.split("://")[0]}://…").`);
   process.exit(1);
 }
 
-const admin = createClient(url, serviceKey, {
-  auth: { autoRefreshToken: false, persistSession: false },
-});
+const ACCOUNTS = [
+  {
+    email: process.env.SEED_ADMIN_EMAIL ?? "admin@warehouse.local",
+    password: process.env.SEED_ADMIN_PASSWORD,
+    fullName: "Warehouse Admin",
+    role: "admin",
+  },
+  {
+    email: process.env.SEED_MANAGER_EMAIL ?? "manager@warehouse.local",
+    password: process.env.SEED_MANAGER_PASSWORD,
+    fullName: "Manager",
+    role: "manager",
+  },
+];
 
-async function findUserByEmail(sb: SupabaseClient, email: string) {
-  // list users pages until found (fine for a handful of accounts)
-  let page = 1;
-  for (;;) {
-    const { data, error } = await sb.auth.admin.listUsers({ page, perPage: 200 });
-    if (error) throw error;
-    const hit = data.users.find((u) => u.email?.toLowerCase() === email.toLowerCase());
-    if (hit) return hit;
-    if (data.users.length < 200) return null;
-    page += 1;
-  }
-}
-
-async function ensureUser(email: string, password: string, fullName: string, role: "admin" | "manager") {
-  if (!password) throw new Error(`Missing password for ${email} — set it in .env.local`);
-
-  let user = await findUserByEmail(admin, email);
-  if (!user) {
-    const { data, error } = await admin.auth.admin.createUser({
-      email,
-      password,
-      email_confirm: true,
-      user_metadata: { full_name: fullName },
-    });
-    if (error) throw error;
-    user = data.user;
-    console.log(`+ created auth user ${email}`);
-  } else {
-    console.log(`= auth user ${email} already exists`);
+async function main(): Promise<void> {
+  const missing = ACCOUNTS.filter((a) => !a.password).map((a) => a.role.toUpperCase());
+  if (missing.length) {
+    console.error(`Set ${missing.map((r) => `SEED_${r}_PASSWORD`).join(" and ")} in .env.local.`);
+    process.exit(1);
   }
 
-  const { error: pErr } = await admin
-    .from("profiles")
-    .upsert({ id: user.id, full_name: fullName, role }, { onConflict: "id" });
-  if (pErr) throw pErr;
-  console.log(`  profile → ${role}`);
-  return user;
-}
-
-async function seedSampleData() {
-  // Two K40 Pro terminals at one gate.
-  const { error: dErr } = await admin.from("devices").upsert(
-    [
-      { serial_number: "K40PRO-A0001", label: "Gate — Terminal 1", is_active: true },
-      { serial_number: "K40PRO-A0002", label: "Gate — Terminal 2", is_active: true },
-    ],
-    { onConflict: "serial_number" }
-  );
-  if (dErr) throw dErr;
-
-  const workers = [
-    { employee_code: "W-001", full_name: "Ramesh Kumar",  device_user_id: 1001, monthly_salary: 15000, joined_on: "2025-01-01" },
-    { employee_code: "W-002", full_name: "Sita Devi",     device_user_id: 1002, monthly_salary: 18000, joined_on: "2025-03-15" },
-    { employee_code: "W-003", full_name: "Abdul Rahman",  device_user_id: 1003, monthly_salary: 16500, joined_on: "2024-11-01" },
-    { employee_code: "W-004", full_name: "Lakshmi Nair",  device_user_id: 1004, monthly_salary: 20000, joined_on: "2025-06-01" },
-  ];
-  const { error: wErr } = await admin.from("workers").upsert(workers, { onConflict: "employee_code" });
-  if (wErr) throw wErr;
-  console.log(`  sample: 2 devices, ${workers.length} workers`);
-}
-
-async function main() {
+  const conn = await mysql.createConnection(url as string);
   try {
-    await ensureUser(
-      process.env.SEED_ADMIN_EMAIL || "admin@warehouse.local",
-      process.env.SEED_ADMIN_PASSWORD || "",
-      "Warehouse Admin",
-      "admin"
-    );
-    await ensureUser(
-      process.env.SEED_MANAGER_EMAIL || "manager@warehouse.local",
-      process.env.SEED_MANAGER_PASSWORD || "",
-      "Warehouse Manager",
-      "manager"
-    );
-    await seedSampleData();
-    console.log("✔ seed complete");
-  } catch (err) {
-    console.error("✗ seed failed:", err instanceof Error ? err.message : err);
-    process.exitCode = 1;
+    for (const a of ACCOUNTS) {
+      const email = a.email.trim().toLowerCase();
+      const hash = await bcrypt.hash(a.password as string, 10);
+
+      const [rows] = await conn.query("SELECT id FROM auth_users WHERE email = ? LIMIT 1", [email]);
+      let id = (rows as { id: string }[])[0]?.id;
+
+      // The two rows are written together: an auth_users row with no profile is
+      // a login that resolves to no role.
+      await conn.beginTransaction();
+      try {
+        if (id) {
+          await conn.query("UPDATE auth_users SET encrypted_password = ? WHERE id = ?", [hash, id]);
+        } else {
+          id = randomUUID();
+          await conn.query(
+            "INSERT INTO auth_users (id, email, encrypted_password) VALUES (?, ?, ?)",
+            [id, email, hash]
+          );
+        }
+        await conn.query(
+          `INSERT INTO profiles (id, full_name, role) VALUES (?, ?, ?)
+           ON DUPLICATE KEY UPDATE full_name = VALUES(full_name), role = VALUES(role)`,
+          [id, a.fullName, a.role]
+        );
+        await conn.commit();
+      } catch (e) {
+        await conn.rollback();
+        throw e;
+      }
+      console.log(`  ${a.role.padEnd(7)} ${email}`);
+    }
+    console.log("\nSeed complete. Sign in with the passwords from .env.local.");
+  } finally {
+    await conn.end();
   }
 }
 
-main();
+main().catch((e) => {
+  console.error(e instanceof Error ? e.message : e);
+  process.exit(1);
+});

@@ -42,15 +42,48 @@ export function chequeIdentityKeys(f: {
   ifsc?: string | null;
   micr_code?: string | null;
 }): string[] {
-  const chq = String(f.cheque_number ?? "").replace(/\D/g, "").replace(/^0+/, "");
-  const acct = String(f.account_number ?? "").replace(/\D/g, "").replace(/^0+/, "");
-  if (!chq || !acct) return [];
+  // A cheque can be read two different ways depending on where the number came
+  // from, and the duplicate guard has to survive that:
+  //
+  //   · Cheque number — some cheques (Union Bank, e.g.) print a "Cheque No"
+  //     box AND a MICR line, and the MICR carries only the last 6 digits.
+  //     35031971 and 031971 are the same leaf.
+  //   · Account number — extraction sometimes grabs a MICR fragment instead of
+  //     the printed account, e.g. 000773 for 321005000773.
+  //
+  // Both cases are a tail of the longer value, so each field contributes its
+  // full form AND its last-6 form, and any key matching means duplicate.
+  // Verified against all live cheques: this introduces zero false positives.
+  const chqs = numForms(f.cheque_number, 6);
+  const accts = numForms(f.account_number, 6);
+  if (!chqs.length || !accts.length) return [];
+
   const ifsc = String(f.ifsc ?? "").toUpperCase().replace(/[^A-Z0-9]/g, "");
   const micr = String(f.micr_code ?? "").replace(/\D/g, "");
+
   const keys: string[] = [];
-  if (ifsc) keys.push(`I:${ifsc}|${acct}|${chq}`);
-  if (micr) keys.push(`M:${micr}|${acct}|${chq}`);
+  for (const acct of accts) {
+    for (const chq of chqs) {
+      if (ifsc) keys.push(`I:${ifsc}|${acct}|${chq}`);
+      if (micr) keys.push(`M:${micr}|${acct}|${chq}`);
+    }
+  }
   return keys;
+}
+
+/**
+ * Comparable forms of a numeric field: the whole value, plus its last `tail`
+ * digits when it is longer than that. Leading zeros are dropped so 000308 and
+ * 308 compare equal — but a value that is all zeros keeps its digits rather
+ * than collapsing to an empty string.
+ */
+function numForms(v: string | null | undefined, tail: number): string[] {
+  const n = String(v ?? "").replace(/\D/g, "");
+  if (!n) return [];
+  const strip = (s: string) => s.replace(/^0+/, "") || s;
+  const out = new Set<string>([strip(n)]);
+  if (n.length > tail) out.add(strip(n.slice(-tail)));
+  return [...out];
 }
 
 // ── Amount → words (Indian numbering: crore / lakh / thousand) ────────────────

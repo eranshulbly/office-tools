@@ -1,11 +1,11 @@
 "use client";
 
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Card, FormError, FormOk } from "@/components/ui";
 import type { ChequeFields } from "@/lib/types";
 import { amountToWords, chequeIdentityKeys } from "@/lib/cheque";
-import { createCheques, extractCheque, detectRotation } from "./actions";
+import { createCheques, extractCheque, detectRotation, findKnownDuplicates } from "./actions";
 import { CHEQUE_FIELD_DEFS as FIELDS, chequeMissingRequired } from "./fields";
 
 const inputClass = "mt-0.5 w-full rounded border border-line px-2.5 py-1.5 text-sm";
@@ -356,11 +356,70 @@ export function ChequeEntry() {
     return dups;
   }, [entries]);
 
+  // Declared here (rather than further down) because the duplicate check below
+  // must wait for extraction to finish before reading the fields.
+  const extracting = entries.filter((e) => e.status === "queued" || e.status === "extracting").length;
+
+  /**
+   * Cheques that already exist in the system (submitted / presented / passed).
+   * Checked on the server the moment extraction settles, so a duplicate is
+   * flagged before the user commits rather than being rejected after saving.
+   * Bounced cheques do not appear here — those may be presented again.
+   */
+  const [knownDupKeys, setKnownDupKeys] = useState<Set<string>>(new Set());
+  const [checkingDups, setCheckingDups] = useState(false);
+
+  useEffect(() => {
+    // Wait for extraction to settle: fields change as each cheque is read, and
+    // checking mid-flight would flag on half-populated values.
+    if (extracting > 0 || entries.length === 0) {
+      if (entries.length === 0) setKnownDupKeys(new Set());
+      return;
+    }
+    let cancelled = false;
+    setCheckingDups(true);
+    const list = entries.map((e) => e.fields);
+    findKnownDuplicates(list)
+      .then((hits) => {
+        if (cancelled) return;
+        setKnownDupKeys(new Set(hits.map((i) => entries[i]?.key).filter(Boolean) as string[]));
+      })
+      .catch(() => {
+        // Never block saving because the check itself failed — the server-side
+        // guard in saveCheques is the real control and still runs.
+        if (!cancelled) setKnownDupKeys(new Set());
+      })
+      .finally(() => !cancelled && setCheckingDups(false));
+    return () => { cancelled = true; };
+    // Re-run when the identity fields change, not on every keystroke elsewhere.
+  }, [extracting, entries.map((e) => chequeIdentityKeys(e.fields).join(",")).join(";")]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  /** Anything that must be removed before saving: in-batch or already banked. */
+  const blockedKeys = useMemo(
+    () => new Set<string>([...dupEntryKeys, ...knownDupKeys]),
+    [dupEntryKeys, knownDupKeys]
+  );
+
+  const blockTitle =
+    knownDupKeys.size > 0
+      ? "Remove the cheque(s) already in the system first"
+      : dupEntryKeys.size > 0
+        ? "Remove the duplicate cheque(s) first"
+        : checkingDups
+          ? "Checking for duplicates…"
+          : extracting > 0
+            ? "Waiting for extraction to finish"
+            : undefined;
+
   const save = async (submit: boolean) => {
     setError(undefined); setOkMsg(undefined);
     if (entries.length === 0) return;
-    if (dupEntryKeys.size > 0) {
-      setError("The same cheque appears more than once in this upload (matched on bank + account + cheque number). Remove the duplicate(s) marked below, then save.");
+    if (blockedKeys.size > 0) {
+      setError(
+        knownDupKeys.size > 0
+          ? "Some cheques are already in the system and not bounced. Remove the ones marked below, then save."
+          : "The same cheque appears more than once in this upload (matched on bank + account + cheque number). Remove the duplicate(s) marked below, then save."
+      );
       return;
     }
     if (submit && entries.some((e) => chequeMissingRequired(e.fields))) {
@@ -381,8 +440,6 @@ export function ChequeEntry() {
     setOkMsg(`${res.count} cheque${res.count === 1 ? "" : "s"} ${submit ? "submitted" : "saved as draft"}.`);
     router.refresh();
   };
-
-  const extracting = entries.filter((e) => e.status === "queued" || e.status === "extracting").length;
 
   return (
     <div className="space-y-4">
@@ -452,8 +509,8 @@ export function ChequeEntry() {
                 type="button"
                 className={BTN_DEFAULT}
                 onClick={() => save(false)}
-                disabled={saving || extracting > 0 || dupEntryKeys.size > 0}
-                title={dupEntryKeys.size > 0 ? "Remove the duplicate cheque(s) first" : extracting > 0 ? "Waiting for extraction to finish" : undefined}
+                disabled={saving || extracting > 0 || checkingDups || blockedKeys.size > 0}
+                title={blockTitle}
               >
                 {saving ? "Saving…" : "Save all as drafts"}
               </button>
@@ -461,13 +518,30 @@ export function ChequeEntry() {
                 type="button"
                 className={BTN_PRIMARY}
                 onClick={() => save(true)}
-                disabled={saving || extracting > 0 || dupEntryKeys.size > 0}
-                title={dupEntryKeys.size > 0 ? "Remove the duplicate cheque(s) first" : extracting > 0 ? "Waiting for extraction to finish" : undefined}
+                disabled={saving || extracting > 0 || checkingDups || blockedKeys.size > 0}
+                title={blockTitle}
               >
-                {saving ? "Saving…" : extracting > 0 ? `Extracting… ${extracting} left` : "Save & submit all"}
+                {saving
+                  ? "Saving…"
+                  : extracting > 0
+                    ? `Extracting… ${extracting} left`
+                    : checkingDups
+                      ? "Checking for duplicates…"
+                      : "Save & submit all"}
               </button>
             </div>
           </div>
+
+          {knownDupKeys.size > 0 && (
+            <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-[var(--color-danger)]">
+              <span className="font-medium">
+                {knownDupKeys.size} cheque{knownDupKeys.size === 1 ? " is" : "s are"} already in the system
+              </span>{" "}
+              and not bounced — {knownDupKeys.size === 1 ? "it has" : "they have"} already been submitted,
+              presented or passed. Remove {knownDupKeys.size === 1 ? "it" : "them"} — marked below — before saving.
+              Only a bounced cheque may be entered again.
+            </div>
+          )}
 
           {dupEntryKeys.size > 0 && (
             <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-[var(--color-danger)]">
@@ -491,6 +565,14 @@ export function ChequeEntry() {
                     <span className="text-xs font-semibold text-faint">CHEQUE {i + 1}</span>
                     {chip && (
                       <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${chip.cls}`}>{chip.label}</span>
+                    )}
+                    {knownDupKeys.has(en.key) && (
+                      <span
+                        className="rounded-full bg-red-100 px-2 py-0.5 text-xs font-medium text-[var(--color-danger)]"
+                        title="This cheque is already in the system and has not bounced"
+                      >
+                        Already in system — remove
+                      </span>
                     )}
                     {dupEntryKeys.has(en.key) && (
                       <span className="rounded-full bg-red-100 px-2 py-0.5 text-xs font-medium text-[var(--color-danger)]">

@@ -1,4 +1,4 @@
-import { requireRole, requireSuiteAccess } from "@/lib/auth";
+import { requireFeature, requireSuiteAccess } from "@/lib/auth";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import {
   PageHeader,
@@ -63,7 +63,7 @@ function num(v: string | number | null | undefined): number {
 }
 
 export default async function DisbursePage() {
-  const profile = await requireRole("admin", "manager");
+  const profile = await requireFeature("disburse");
   requireSuiteAccess(profile, "payroll");
   const isAdmin = profile.role === "admin";
   const supabase = await createSupabaseServerClient();
@@ -84,7 +84,7 @@ export default async function DisbursePage() {
   const { data: advData } = await supabase
     .from("advances")
     .select(
-      "id, amount, reason, requested_at, decided_at, disbursed_at, worker:workers(full_name, employee_code, photo_path, group_id, worker_groups(name))"
+      "id, amount, reason, requested_at, decided_at, disbursed_at, worker:workers(full_name, employee_code, designation, photo_path, group_id, worker_groups(name))"
     )
     .eq("status", "approved")
     .is("recovered_in_run", null)
@@ -109,7 +109,7 @@ export default async function DisbursePage() {
     const { data: lineData } = await supabase
       .from("payroll_lines")
       .select(
-        "id, run_id, worker_id, net, pay_mode, paid_at, payment_reference, workers(full_name, employee_code, photo_path, worker_groups(name))"
+        "id, run_id, worker_id, net, pay_mode, paid_at, payment_reference, workers(full_name, employee_code, designation, photo_path, worker_groups(name))"
       )
       .in(
         "run_id",

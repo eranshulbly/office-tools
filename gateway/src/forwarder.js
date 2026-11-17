@@ -4,7 +4,7 @@ import {
   insertPunches,
   touchDevice,
   recomputeDays,
-} from "./supabase.js";
+} from "./db.js";
 
 /** YYYY-MM-DD for an instant, in the warehouse timezone (drives recompute). */
 function warehouseDay(iso) {

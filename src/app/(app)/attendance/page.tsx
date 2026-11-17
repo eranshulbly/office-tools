@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { requireRole } from "@/lib/auth";
+import { requireFeature } from "@/lib/auth";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import type { DayStatus } from "@/lib/types";
 import {
@@ -13,34 +13,19 @@ import {
   Empty,
   LinkButton,
 } from "@/components/ui";
+import { statusView, warehouseToday } from "@/lib/attendance-status";
 import { Recompute } from "./Recompute";
 import { WorkerSummaryButton } from "./WorkerSummaryButton";
+import { EditTimingButton } from "./EditTimingButton";
 
-type BadgeTone = "neutral" | "ok" | "warn" | "danger" | "info";
-
-const STATUS_TONE: Record<DayStatus, BadgeTone> = {
-  full_day: "ok",
-  absent: "warn",
-  unresolved: "danger",
-  not_working_day: "neutral",
-  late_review: "danger",
-  half_day: "neutral", // legacy only — kept to satisfy the exhaustive Record over DayStatus
-};
-
-const STATUS_LABEL: Record<DayStatus, string> = {
-  full_day: "Full day",
-  absent: "Absent",
-  unresolved: "Unresolved",
-  not_working_day: "Not working",
-  late_review: "Late — review",
-  half_day: "Half day (legacy)", // legacy only — never produced now
-};
+// Labels and tones live in @/lib/attendance-status so the day grid, the
+// per-worker summary and the payroll exception lists cannot drift apart.
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
-function todayStr(): string {
-  return new Date().toISOString().slice(0, 10);
-}
+// The warehouse's today, not UTC's: between midnight and 05:30 IST those are
+// different dates, and the grid would open on yesterday.
+const todayStr = warehouseToday;
 
 function shiftDay(day: string, delta: number): string {
   const dt = new Date(day + "T00:00:00Z");
@@ -53,7 +38,7 @@ function fmtTime(ts: string | null): string {
   return new Date(ts).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" });
 }
 
-type WorkerRow = { id: string; employee_code: string; full_name: string };
+type WorkerRow = { id: string; employee_code: string; full_name: string; designation: string | null };
 type AttRow = {
   worker_id: string;
   first_in: string | null;
@@ -68,7 +53,7 @@ export default async function AttendancePage({
 }: {
   searchParams: Promise<{ day?: string }>;
 }) {
-  await requireRole("admin");
+  await requireFeature("attendance");
   const sp = await searchParams;
   const day = sp.day && DATE_RE.test(sp.day) ? sp.day : todayStr();
 
@@ -77,7 +62,7 @@ export default async function AttendancePage({
   const [{ data: workers }, { data: att }] = await Promise.all([
     supabase
       .from("workers")
-      .select("id, employee_code, full_name")
+      .select("id, employee_code, full_name, designation")
       .eq("is_active", true)
       .order("employee_code"),
     supabase
@@ -85,6 +70,15 @@ export default async function AttendancePage({
       .select("worker_id, first_in, last_out, worked_hours, status, is_from_adjustment")
       .eq("day", day),
   ]);
+
+  // Shown in the edit dialog so an admin can see which side of the line a span
+  // falls on before saving, rather than saving and then reading the badge.
+  const { data: fullDayRow } = await supabase
+    .from("settings")
+    .select("value")
+    .eq("key", "full_day_hours")
+    .maybeSingle();
+  const fullDayHours = Number((fullDayRow as { value: unknown } | null)?.value ?? 8) || 8;
 
   const byWorker = new Map<string, AttRow>();
   for (const r of (att ?? []) as AttRow[]) byWorker.set(r.worker_id, r);
@@ -95,7 +89,7 @@ export default async function AttendancePage({
     <div>
       <PageHeader
         title="Attendance"
-        subtitle="Per-employee day grid. Click a name for their monthly summary. Read-only."
+        subtitle="Per-employee day grid. Click a name for their monthly summary; edit a timing to correct a day."
       />
 
       <Section>
@@ -151,11 +145,15 @@ export default async function AttendancePage({
                       workerId={w.id}
                       name={w.full_name}
                       code={w.employee_code}
+                      designation={w.designation}
                     />
                   </Td>
                   <Td>
                     {a ? (
-                      <Badge tone={STATUS_TONE[a.status]}>{STATUS_LABEL[a.status]}</Badge>
+                      (() => {
+                        const v = statusView(a.status, day);
+                        return <Badge tone={v.tone}>{v.label}</Badge>;
+                      })()
                     ) : (
                       <Badge tone="neutral">No data</Badge>
                     )}
@@ -173,12 +171,23 @@ export default async function AttendancePage({
                     )}
                   </Td>
                   <Td>
-                    <Link
-                      href={`/attendance/${w.id}?day=${day}`}
-                      className="text-brand text-sm hover:underline"
-                    >
-                      Punches →
-                    </Link>
+                    <div className="flex items-center gap-3 whitespace-nowrap">
+                      <EditTimingButton
+                        workerId={w.id}
+                        name={w.full_name}
+                        code={w.employee_code}
+                        day={day}
+                        firstIn={a?.first_in ?? null}
+                        lastOut={a?.last_out ?? null}
+                        fullDayHours={fullDayHours}
+                      />
+                      <Link
+                        href={`/attendance/${w.id}?day=${day}`}
+                        className="text-brand text-sm hover:underline"
+                      >
+                        Punches →
+                      </Link>
+                    </div>
                   </Td>
                 </tr>
               );

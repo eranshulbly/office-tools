@@ -1,4 +1,4 @@
-import { requireRole, requireSuiteAccess } from "@/lib/auth";
+import { requireFeature, requireSuiteAccess } from "@/lib/auth";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import type { RequestStatus } from "@/lib/types";
 import {
@@ -45,13 +45,13 @@ function parseCapMultiple(value: unknown): number {
 }
 
 export default async function AdvancesPage() {
-  requireSuiteAccess(await requireRole("manager"), "payroll");
+  requireSuiteAccess(await requireFeature("advances"), "payroll");
   const supabase = await createSupabaseServerClient();
 
   const [workersRes, outstandingRes, advancesRes, capRes] = await Promise.all([
     supabase
       .from("workers")
-      .select("id, full_name, employee_code, monthly_salary")
+      .select("id, full_name, employee_code, designation, monthly_salary")
       .eq("is_active", true)
       .order("full_name"),
     // Outstanding = approved + disbursed + not-yet-recovered advances (§3.7 / conventions).
@@ -64,7 +64,7 @@ export default async function AdvancesPage() {
     supabase
       .from("advances")
       .select(
-        "id, amount, reason, status, requested_at, disbursed_at, decision_reason, worker:workers(full_name, employee_code)"
+        "id, amount, reason, status, requested_at, disbursed_at, decision_reason, worker:workers(full_name, employee_code, designation)"
       )
       .order("requested_at", { ascending: false }),
     supabase.from("settings").select("value").eq("key", "advance_cap_multiple").single(),

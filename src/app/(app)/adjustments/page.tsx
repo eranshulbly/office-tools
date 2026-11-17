@@ -1,4 +1,4 @@
-import { requireRole, requireSuiteAccess } from "@/lib/auth";
+import { requireFeature, requireSuiteAccess } from "@/lib/auth";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import type { RequestStatus } from "@/lib/types";
 import {
@@ -38,19 +38,19 @@ function ts(v: string | null): string {
 }
 
 export default async function AdjustmentsPage() {
-  requireSuiteAccess(await requireRole("manager"), "hr");
+  requireSuiteAccess(await requireFeature("adjustments"), "hr");
   const supabase = await createSupabaseServerClient();
 
   const [workersRes, adjustmentsRes] = await Promise.all([
     supabase
       .from("workers")
-      .select("id, full_name, employee_code")
+      .select("id, full_name, employee_code, designation")
       .eq("is_active", true)
       .order("full_name"),
     supabase
       .from("adjustments")
       .select(
-        "id, day, proposed_in, proposed_out, reason, status, requested_at, decision_reason, worker:workers(full_name, employee_code)"
+        "id, day, proposed_in, proposed_out, reason, status, requested_at, decision_reason, worker:workers(full_name, employee_code, designation)"
       )
       .order("requested_at", { ascending: false }),
   ]);

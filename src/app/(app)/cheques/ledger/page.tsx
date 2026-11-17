@@ -1,4 +1,4 @@
-import { requireRole } from "@/lib/auth";
+import { requireFeature } from "@/lib/auth";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import type { Cheque } from "@/lib/types";
 import type { SystemCheque } from "@/lib/cheque-ledger";
@@ -10,7 +10,7 @@ import { FirmBar } from "../FirmPicker";
 export const dynamic = "force-dynamic";
 
 export default async function ChequeLedgerPage() {
-  await requireRole("admin");
+  await requireFeature("cheque-ledger");
   const firm = await requireFirm();
   const firms = await listFirms();
   const supabase = await createSupabaseServerClient();

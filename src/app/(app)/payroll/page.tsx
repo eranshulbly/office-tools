@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { requireRole } from "@/lib/auth";
+import { requireFeature } from "@/lib/auth";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import {
   PageHeader,
@@ -63,7 +63,7 @@ function suggestedRun() {
 }
 
 export default async function PayrollPage() {
-  await requireRole("admin");
+  await requireFeature("payroll");
   const supabase = await createSupabaseServerClient();
 
   const { data: runs } = await supabase

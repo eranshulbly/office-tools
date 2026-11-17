@@ -1,4 +1,4 @@
-import { requireRole } from "@/lib/auth";
+import { requireFeature } from "@/lib/auth";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import type { CompanyBankAccount } from "@/lib/types";
 import {
@@ -12,7 +12,7 @@ import { FirmBar } from "../FirmPicker";
 export const dynamic = "force-dynamic";
 
 export default async function BankAccountsPage() {
-  await requireRole("admin");
+  await requireFeature("cheque-banks");
   const firm = await requireFirm();
   const firms = await listFirms();
   const supabase = await createSupabaseServerClient();

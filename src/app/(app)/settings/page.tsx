@@ -1,10 +1,10 @@
-import { requireRole } from "@/lib/auth";
+import { requireFeature } from "@/lib/auth";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { PageHeader, FormError, Empty } from "@/components/ui";
 import { SettingsForm, type SettingRow } from "./SettingsForm";
 
 export default async function SettingsPage() {
-  await requireRole("admin");
+  await requireFeature("settings");
 
   const supabase = await createSupabaseServerClient();
   const { data, error } = await supabase

@@ -2,6 +2,7 @@
 
 import { revalidatePath } from "next/cache";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
+import { ADJUSTMENT_REASONS, isAdjustmentReason } from "@/lib/adjustments";
 
 export type AdjustmentFormState = { error?: string; ok?: boolean };
 
@@ -28,6 +29,13 @@ export async function requestAdjustment(
   if (!worker_id) return { error: "Select an employee." };
   if (!day) return { error: "Day is required." };
   if (!reason) return { error: "A reason is required." };
+  // The reason is a closed list, and it decides how the request is handled —
+  // so it is checked here, not just in the dropdown. A server action is
+  // reachable without the form, and an arbitrary string posted straight at it
+  // would otherwise be stored and have to be read by a human.
+  if (!isAdjustmentReason(reason)) {
+    return { error: `Reason must be one of: ${ADJUSTMENT_REASONS.join(", ")}.` };
+  }
   if (!proposed_in && !proposed_out)
     return { error: "Provide at least one of proposed IN or proposed OUT." };
 

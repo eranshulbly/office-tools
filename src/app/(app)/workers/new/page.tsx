@@ -1,11 +1,11 @@
-import { requireRole, requireSuiteAccess } from "@/lib/auth";
+import { requireFeature, requireSuiteAccess } from "@/lib/auth";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { PageHeader, LinkButton, Card } from "@/components/ui";
 import { WorkerForm } from "../WorkerForm";
 import { ManagerWorkerForm } from "../ManagerWorkerForm";
 
 export default async function NewWorkerPage() {
-  const profile = await requireRole("admin", "manager");
+  const profile = await requireFeature("workers");
   requireSuiteAccess(profile, "hr");
   const supabase = await createSupabaseServerClient();
 

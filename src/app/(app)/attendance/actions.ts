@@ -2,6 +2,8 @@
 
 import { revalidatePath } from "next/cache";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
+import { requireRole } from "@/lib/auth";
+import { isPunchedIn, warehouseTimeToUtcSql } from "@/lib/attendance-status";
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -51,6 +53,8 @@ export type WorkerAttendance =
         half_day: number;
         absent: number;
         unresolved: number;
+        /** Days still running: one punch so far, nobody needs to fix anything. */
+        punched_in: number;
         not_working_day: number;
         late_review: number;
         present: number;
@@ -88,9 +92,62 @@ export async function getWorkerAttendance(
   for (const r of rows) {
     if (r.status in s) s[r.status as keyof typeof s] += 1;
   }
+  // A day still in progress is stored as unresolved but is not an exception —
+  // count it separately so the popup does not report a red "Unresolved 1" for
+  // somebody who simply has not gone home yet.
+  const punched_in = rows.filter((r) => isPunchedIn(r.status, r.day)).length;
+  s.unresolved -= punched_in;
   const present = s.full_day; // half_day is always 0 in the 2-state model
   const working_days = s.full_day + s.absent + s.unresolved + s.late_review; // excludes closed days
   const leave_units = s.absent; // = absent (half_day is always 0 now)
 
-  return { rows, summary: { ...s, present, working_days, leave_units } };
+  return { rows, summary: { ...s, punched_in, present, working_days, leave_units } };
+}
+
+export type TimingState = { error?: string; ok?: boolean };
+
+const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
+
+/**
+ * Admin sets one employee's IN/OUT for one day.
+ *
+ * Admin-only twice over: `requireRole` here, and `requireAdmin` inside the RPC.
+ * The page guard alone is not enough — a server action is a public endpoint,
+ * reachable regardless of what the UI chose to render.
+ *
+ * Present or absent is not passed in; it FOLLOWS from the times, the same way
+ * it does for a real pair of punches. A span of at least `full_day_hours` is a
+ * present day, anything shorter is absent, and clearing both times hands the
+ * day back to the device record.
+ */
+export async function setAttendanceTiming(
+  _prev: TimingState,
+  formData: FormData
+): Promise<TimingState> {
+  await requireRole("admin");
+
+  const worker_id = String(formData.get("worker_id") ?? "").trim();
+  const day = String(formData.get("day") ?? "").trim();
+  const inTime = String(formData.get("in_time") ?? "").trim();
+  const outTime = String(formData.get("out_time") ?? "").trim();
+  const reason = String(formData.get("reason") ?? "").trim();
+
+  if (!worker_id || !DATE_RE.test(day)) return { error: "Invalid employee or day." };
+  if (!reason) return { error: "A reason is required — this is recorded in the audit trail." };
+  if (inTime && !TIME_RE.test(inTime)) return { error: "IN time must be HH:MM." };
+  if (outTime && !TIME_RE.test(outTime)) return { error: "OUT time must be HH:MM." };
+  if (inTime && outTime && outTime <= inTime) return { error: "OUT must be later than IN." };
+
+  const supabase = await createSupabaseServerClient();
+  const { error } = await supabase.rpc("admin_set_attendance", {
+    p_worker_id: worker_id,
+    p_day: day,
+    p_in: inTime ? warehouseTimeToUtcSql(day, inTime) : null,
+    p_out: outTime ? warehouseTimeToUtcSql(day, outTime) : null,
+    p_reason: reason,
+  });
+  if (error) return { error: error.message };
+
+  revalidatePath("/attendance");
+  return { ok: true };
 }

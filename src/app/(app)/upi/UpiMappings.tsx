@@ -3,9 +3,10 @@
 import { useMemo, useRef, useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
 import { Card, Table, Th, Td, Empty, FormError, FormOk } from "@/components/ui";
-import type { UpiMapping } from "@/lib/types";
-import { extractVpa, FIRMS, DEFAULT_FIRM, type Firm } from "@/lib/upi";
+import type { UpiMapping, UpiPayerAccount } from "@/lib/types";
+import { extractVpa, extractPayerAccount, FIRMS, DEFAULT_FIRM, type Firm } from "@/lib/upi";
 import { addMapping, deleteMapping, bulkAddMappings } from "./actions";
+import { PayerAccounts } from "./PayerAccounts";
 
 const selectClass = "rounded-lg border border-line bg-surface px-3 py-2 text-sm font-medium text-ink";
 
@@ -15,9 +16,10 @@ const BTN =
 const BTN_OUTLINE =
   "inline-flex items-center justify-center gap-1.5 rounded-lg border border-line bg-surface px-3.5 py-2 text-sm font-medium text-ink hover:bg-[var(--color-surface-2)] disabled:opacity-50";
 
-export function UpiMappings({ mappings }: { mappings: UpiMapping[] }) {
+export function UpiMappings({ mappings, accounts }: { mappings: UpiMapping[]; accounts: UpiPayerAccount[] }) {
   const router = useRouter();
   const [firm, setFirm] = useState<Firm>(DEFAULT_FIRM);
+  const [tab, setTab] = useState<"ids" | "accounts">("ids");
   const [upiId, setUpiId] = useState("");
   const [dealer, setDealer] = useState("");
   const [q, setQ] = useState("");
@@ -48,14 +50,18 @@ export function UpiMappings({ mappings }: { mappings: UpiMapping[] }) {
         setBulkError('Could not find "Narration" and "Dealer" columns. Upload a reconciliation download with the Dealer column filled in.');
         return;
       }
-      // For each row where you filled the Dealer, pull the UPI ID out of the narration.
-      const pairs: { upi_id: string; dealer_name: string }[] = [];
+      // For each row where you filled the Dealer, pull the UPI ID and the payer
+      // account out of the narration. Masked UPI IDs are dropped server-side;
+      // the account still teaches us who the payer is.
+      const pairs: { upi_id: string | null; payer_account: string | null; dealer_name: string }[] = [];
       for (let i = hi + 1; i < rows.length; i++) {
         const r = rows[i] as string[];
         const dealer = String(r[iDealer] ?? "").trim();
         if (!dealer) continue;
-        const vpa = extractVpa(String(r[iNarr] ?? ""));
-        if (vpa) pairs.push({ upi_id: vpa, dealer_name: dealer });
+        const narration = String(r[iNarr] ?? "");
+        const vpa = extractVpa(narration);
+        const account = extractPayerAccount(narration);
+        if (vpa || account) pairs.push({ upi_id: vpa, payer_account: account, dealer_name: dealer });
       }
       if (pairs.length === 0) {
         setBulkError("No rows with a filled Dealer column (and a UPI narration) were found.");
@@ -64,7 +70,12 @@ export function UpiMappings({ mappings }: { mappings: UpiMapping[] }) {
       const res = await bulkAddMappings(pairs, firm);
       if (res.error) setBulkError(res.error);
       else {
-        setBulkMsg(`Added ${res.added ?? 0} new mapping${res.added === 1 ? "" : "s"}${res.skipped ? `, ${res.skipped} already mapped (skipped)` : ""}.`);
+        const parts = [
+          `Added ${res.added ?? 0} new UPI ID mapping${res.added === 1 ? "" : "s"}${res.skipped ? ` (${res.skipped} already mapped)` : ""}`,
+          `saved ${res.accounts ?? 0} payer account${res.accounts === 1 ? "" : "s"}`,
+        ];
+        if (res.conflicts) parts.push(`skipped ${res.conflicts} account${res.conflicts === 1 ? "" : "s"} given two different dealers in the file`);
+        setBulkMsg(parts.join(", ") + ".");
         router.refresh();
       }
     } catch (e) {
@@ -77,6 +88,7 @@ export function UpiMappings({ mappings }: { mappings: UpiMapping[] }) {
 
   // Everything on this tab is scoped to the selected firm.
   const firmMappings = useMemo(() => mappings.filter((m) => m.firm === firm), [mappings, firm]);
+  const firmAccounts = useMemo(() => accounts.filter((a) => a.firm === firm), [accounts, firm]);
   const filtered = useMemo(() => {
     const s = q.trim().toLowerCase();
     if (!s) return firmMappings;
@@ -172,8 +184,9 @@ export function UpiMappings({ mappings }: { mappings: UpiMapping[] }) {
         <div className="text-sm font-semibold text-ink">Bulk upload</div>
         <p className="mt-1 text-xs text-muted">
           Upload a reconciliation download (from the Reconcile tab). For every row where you filled the <span className="text-ink">Dealer</span> column,
-          the UPI ID is read from the <span className="text-ink">Narration</span> and mapped to that dealer — unless it&apos;s already mapped.
-          The “Potential dealer” column is ignored; copy a suggestion into the Dealer column to confirm it.
+          the UPI ID and payer account are read from the <span className="text-ink">Narration</span> and saved for that dealer. A UPI ID already
+          mapped is left alone; a payer account takes the dealer you entered. The “Potential dealer” column is ignored; copy a
+          suggestion into the Dealer column to confirm it.
         </p>
         <div className="mt-3 flex items-center gap-2">
           <input
@@ -193,6 +206,27 @@ export function UpiMappings({ mappings }: { mappings: UpiMapping[] }) {
         </div>
       </Card>
 
+      <div className="flex gap-1 border-b border-line">
+        {([
+          ["ids", `UPI IDs (${firmMappings.length})`],
+          ["accounts", `Payer accounts (${firmAccounts.length})`],
+        ] as const).map(([key, label]) => (
+          <button
+            key={key}
+            type="button"
+            onClick={() => setTab(key)}
+            className={`-mb-px border-b-2 px-3 py-2 text-sm font-medium ${
+              tab === key ? "border-[var(--color-brand)] text-ink" : "border-transparent text-muted hover:text-ink"
+            }`}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {tab === "accounts" ? (
+        <PayerAccounts key={firm} accounts={firmAccounts} firm={firm} />
+      ) : (
       <div>
         <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
           <input
@@ -263,6 +297,7 @@ export function UpiMappings({ mappings }: { mappings: UpiMapping[] }) {
           </>
         )}
       </div>
+      )}
     </div>
   );
 }

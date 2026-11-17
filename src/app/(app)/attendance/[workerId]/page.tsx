@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { requireRole } from "@/lib/auth";
+import { requireFeature } from "@/lib/auth";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { PageHeader, Section, Table, Th, Td, Badge, Empty } from "@/components/ui";
 
@@ -44,7 +44,7 @@ export default async function WorkerPunchesPage({
   params: Promise<{ workerId: string }>;
   searchParams: Promise<{ day?: string }>;
 }) {
-  await requireRole("admin");
+  await requireFeature("attendance");
   const { workerId } = await params;
   const sp = await searchParams;
   const day = sp.day && DATE_RE.test(sp.day) ? sp.day : todayStr();
@@ -54,7 +54,7 @@ export default async function WorkerPunchesPage({
   const [{ data: worker }, { data: punches }] = await Promise.all([
     supabase
       .from("workers")
-      .select("employee_code, full_name")
+      .select("employee_code, full_name, designation")
       .eq("id", workerId)
       .maybeSingle(),
     supabase

@@ -1,24 +1,26 @@
 "use client";
 
-import { useMemo, useRef, useState } from "react";
-import { Card, Section, Badge, Table, Th, Td, Empty, money, FormError } from "@/components/ui";
-import { extractVpa, normUpi, FIRMS, DEFAULT_FIRM, type Firm } from "@/lib/upi";
+import { useMemo, useRef, useState, useTransition } from "react";
+import { Card, Section, Badge, Table, Th, Td, Empty, money, FormError, FormOk } from "@/components/ui";
+import { extractVpa, extractPayerAccount, isMaskedVpa, FIRMS, DEFAULT_FIRM, type Firm } from "@/lib/upi";
+import { buildMatchIndex, matchLine, tierOf, type Match } from "@/lib/upi-match";
+import { confirmMatch, saveLearnedAccounts } from "../actions";
 
-export type Mapping = { upi_id: string; dealer_name: string; review?: string | null; firm: string };
+export type Mapping = { upi_id: string; dealer_name: string; review?: string | null; alt_dealer?: string | null; firm: string };
+export type PayerAccount = { payer_account: string; dealer_name: string; firm: string };
 
-// A parsed statement row, before dealer labelling (labelling depends on the firm).
+// A parsed statement row, before dealer matching (matching depends on the firm).
 type ParsedTxn = {
   raw: string[];    // the ORIGINAL row cells, unchanged, for export
   date: string;
   narration: string;
   vpa: string | null;
+  account: string | null;
   credit: number;
   debit: number;
 };
-type Txn = ParsedTxn & {
-  dealer: string | null;          // exact VPA match (confirmed)
-  potentialDealer: string | null; // by number/username (suggested, not confirmed)
-};
+type Tier = ReturnType<typeof tierOf>;
+type Txn = ParsedTxn & { match: Match; tier: Tier };
 
 const selectClass = "rounded-lg border border-line bg-surface px-3 py-2 text-sm font-medium text-ink";
 
@@ -26,8 +28,12 @@ const BTN =
   "inline-flex items-center justify-center gap-1.5 rounded-lg border border-transparent bg-[var(--color-brand)] px-3.5 py-2 text-sm font-medium text-white hover:bg-[var(--color-brand-strong)] disabled:opacity-50";
 const BTN_OUTLINE =
   "inline-flex items-center justify-center gap-1.5 rounded-lg border border-line bg-surface px-3.5 py-2 text-sm font-medium text-ink hover:bg-[var(--color-surface-2)]";
+const BTN_SM =
+  "inline-flex items-center justify-center rounded border border-transparent bg-[var(--color-brand)] px-2 py-1 text-xs font-medium text-white hover:bg-[var(--color-brand-strong)] disabled:opacity-50";
 
 const DATE_RE = /^\d{2}\/\d{2}\/\d{2,4}$/;
+const DEALER_LIST_ID = "upi-dealer-names";
+const MIN_SCORES = [10, 20, 30, 40, 50, 70];
 
 function amt(v: unknown): number {
   const n = parseFloat(String(v ?? "").replace(/,/g, ""));
@@ -38,9 +44,9 @@ async function loadXlsx() {
   return (mod as unknown as { default?: typeof mod }).default ?? mod;
 }
 
-type View = "all" | "confirmed" | "suggested" | "unmapped" | "credit" | "debit";
+type View = "all" | "confirmed" | "likely" | "possible" | "unmapped" | "credit" | "debit";
 
-export function ReconcileUploader({ mappings }: { mappings: Mapping[] }) {
+export function ReconcileUploader({ mappings, accounts }: { mappings: Mapping[]; accounts: PayerAccount[] }) {
   const [firm, setFirm] = useState<Firm>(DEFAULT_FIRM);
   const [rows, setRows] = useState<ParsedTxn[] | null>(null);
   const [headerRow, setHeaderRow] = useState<string[]>([]);
@@ -49,51 +55,50 @@ export function ReconcileUploader({ mappings }: { mappings: Mapping[] }) {
   const [error, setError] = useState<string>();
   const [q, setQ] = useState("");
   const [view, setView] = useState<View>("all");
+  const [minScore, setMinScore] = useState(30);
+  // Answers saved during this session, so every row re-matches at once
+  // without waiting for a server round-trip.
+  const [savedAccounts, setSavedAccounts] = useState<PayerAccount[]>([]);
+  const [savedVpas, setSavedVpas] = useState<Mapping[]>([]);
+  const [learnMsg, setLearnMsg] = useState<string>();
+  const [learnErr, setLearnErr] = useState<string>();
+  const [learning, startLearning] = useTransition();
   const fileRef = useRef<HTMLInputElement>(null);
 
-  // Lookup tables built from the SELECTED firm's mappings only.
-  // exact VPA lookup + unambiguous number/username lookup (before the @).
-  // A mapping with a non-blank `review` (e.g. "Ambiguous - verify") is NOT a
-  // confirmed dealer — an exact hit on it is shown as a suggestion instead.
-  const { mapByUpi, mapByLocal } = useMemo(() => {
-    const byUpi = new Map<string, { dealer: string; confirmed: boolean }>();
-    const localDealers = new Map<string, Set<string>>();
-    for (const row of mappings) {
-      if (row.firm !== firm) continue;
-      const key = normUpi(row.upi_id);
-      byUpi.set(key, { dealer: row.dealer_name, confirmed: !String(row.review ?? "").trim() });
-      const local = key.split("@")[0];
-      if (local) {
-        const set = localDealers.get(local) ?? new Set<string>();
-        set.add(row.dealer_name);
-        localDealers.set(local, set);
-      }
-    }
-    const byLocal = new Map<string, string>();
-    for (const [local, dealers] of localDealers) if (dealers.size === 1) byLocal.set(local, [...dealers][0]);
-    return { mapByUpi: byUpi, mapByLocal: byLocal };
-  }, [mappings, firm]);
+  const firmVpas = useMemo(
+    () => [...mappings, ...savedVpas].filter((m) => m.firm === firm),
+    [mappings, savedVpas, firm]
+  );
+  const firmAccounts = useMemo(
+    () => [...accounts, ...savedAccounts].filter((a) => a.firm === firm),
+    [accounts, savedAccounts, firm]
+  );
 
-  // Label each parsed row against the current firm's mappings. Re-runs when the
-  // firm changes, so switching firm instantly re-labels the loaded statement.
+  // Rebuilt when the firm, the statement or any saved answer changes.
+  const index = useMemo(() => buildMatchIndex(firmVpas, firmAccounts, rows ?? []), [firmVpas, firmAccounts, rows]);
+
   const txns: Txn[] | null = useMemo(() => {
     if (!rows) return null;
     return rows.map((t) => {
-      let dealer: string | null = null;
-      let potentialDealer: string | null = null;
-      if (t.vpa) {
-        const key = normUpi(t.vpa);
-        const hit = mapByUpi.get(key);
-        if (hit?.confirmed) dealer = hit.dealer;               // exact, review blank → confirmed
-        else if (hit) potentialDealer = hit.dealer;            // exact but flagged → suggested
-        else potentialDealer = mapByLocal.get(key.split("@")[0]) ?? null; // by number/username
-      }
-      return { ...t, dealer, potentialDealer };
+      const match = matchLine(t, index);
+      return { ...t, match, tier: tierOf(match, minScore) };
     });
-  }, [rows, mapByUpi, mapByLocal]);
+  }, [rows, index, minScore]);
+
+  // Accounts this statement taught us from cleanly-mapped UPI IDs, not yet saved.
+  const learnable = useMemo(() => [...index.learned.values()].filter((l) => !l.flagged), [index]);
+
+  const dealerNames = useMemo(() => {
+    const s = new Set<string>();
+    for (const m of firmVpas) if (!/^\(.*\)$/.test(m.dealer_name.trim())) s.add(m.dealer_name);
+    for (const a of firmAccounts) s.add(a.dealer_name);
+    return [...s].sort((a, b) => a.localeCompare(b));
+  }, [firmVpas, firmAccounts]);
 
   async function handleFile(file: File) {
     setError(undefined);
+    setLearnMsg(undefined);
+    setLearnErr(undefined);
     setBusy(true);
     setRows(null);
     try {
@@ -116,7 +121,11 @@ export function ReconcileUploader({ mappings }: { mappings: Mapping[] }) {
         const narration = r[1]?.trim() ?? "";
         if (/end of statement/i.test(narration)) break;
         if (!DATE_RE.test(c0)) continue;
-        out.push({ raw: r, date: c0, narration, vpa: extractVpa(narration), debit: amt(r[4]), credit: amt(r[5]) });
+        out.push({
+          raw: r, date: c0, narration,
+          vpa: extractVpa(narration), account: extractPayerAccount(narration),
+          debit: amt(r[4]), credit: amt(r[5]),
+        });
       }
       if (out.length === 0) setError("No transactions found. Is this an HDFC account statement (.xls/.xlsx)?");
       setHeaderRow(hdr);
@@ -130,34 +139,49 @@ export function ReconcileUploader({ mappings }: { mappings: Mapping[] }) {
     }
   }
 
+  function onConfirmed(dealer: string, account: string | null, vpa: string | null, savedVpa: boolean) {
+    if (account) setSavedAccounts((a) => [...a, { payer_account: account, dealer_name: dealer, firm }]);
+    if (vpa && savedVpa) setSavedVpas((v) => [...v, { upi_id: vpa, dealer_name: dealer, firm }]);
+  }
+
+  function saveLearned() {
+    setLearnMsg(undefined);
+    setLearnErr(undefined);
+    const batch = learnable.map((l) => ({ payer_account: l.payer_account, dealer_name: l.dealer_name, sample_vpa: l.sample_vpa }));
+    startLearning(async () => {
+      const res = await saveLearnedAccounts(firm, batch);
+      if (res.error) return setLearnErr(res.error);
+      setSavedAccounts((a) => [...a, ...batch.map((b) => ({ payer_account: b.payer_account, dealer_name: b.dealer_name, firm }))]);
+      setLearnMsg(`Saved ${res.added ?? 0} payer account${res.added === 1 ? "" : "s"}${res.skipped ? ` (${res.skipped} already saved)` : ""}.`);
+    });
+  }
+
   const summary = useMemo(() => {
     if (!txns) return null;
-    let credit = 0, debit = 0, confirmed = 0, suggested = 0, unmapped = 0;
+    let credit = 0, debit = 0, masked = 0;
+    const tiers: Record<Tier, number> = { confirmed: 0, likely: 0, possible: 0, unmapped: 0, "not-upi": 0 };
     for (const t of txns) {
       credit += t.credit;
       debit += t.debit;
-      if (t.dealer) confirmed++;
-      else if (t.potentialDealer) suggested++;
-      else if (t.vpa) unmapped++;
+      tiers[t.tier]++;
+      if (isMaskedVpa(t.vpa)) masked++;
     }
-    return { credit, debit, confirmed, suggested, unmapped };
+    return { credit, debit, masked, ...tiers };
   }, [txns]);
 
   const filtered = useMemo(() => {
     if (!txns) return [];
     const s = q.trim().toLowerCase();
     return txns.filter((t) => {
-      if (view === "confirmed" && !t.dealer) return false;
-      if (view === "suggested" && !t.potentialDealer) return false;
-      if (view === "unmapped" && (t.dealer || t.potentialDealer || !t.vpa)) return false;
+      if ((view === "confirmed" || view === "likely" || view === "possible" || view === "unmapped") && t.tier !== view) return false;
       if (view === "credit" && !(t.credit > 0)) return false;
       if (view === "debit" && !(t.debit > 0)) return false;
       if (!s) return true;
       return (
         t.narration.toLowerCase().includes(s) ||
         (t.vpa ?? "").toLowerCase().includes(s) ||
-        (t.dealer ?? "").toLowerCase().includes(s) ||
-        (t.potentialDealer ?? "").toLowerCase().includes(s) ||
+        (t.account ?? "").includes(s) ||
+        t.match.candidates.some((c) => c.dealer.toLowerCase().includes(s)) ||
         String(t.credit).includes(s) || String(t.debit).includes(s) || t.date.includes(s)
       );
     });
@@ -166,16 +190,28 @@ export function ReconcileUploader({ mappings }: { mappings: Mapping[] }) {
   async function exportExcel() {
     if (!txns) return;
     const XLSX = await loadXlsx();
-    // Keep the original statement columns in their original order; append the two.
+    // Keep the original statement columns in their original order; append ours.
+    // "Dealer" holds confirmed matches only — fill it in for the rest and upload
+    // the file on the Dealer UPI IDs tab to teach the system.
     const ncol = headerRow.length;
-    const header = [...headerRow, "Dealer", "Potential dealer"];
+    const header = [...headerRow, "Dealer", "Potential dealer", "Confidence %", "Match reason", "Other candidates", "Payer account"];
     const aoa: string[][] = [
       header,
       ...txns.map((t) => {
         const cells = [...t.raw];
         while (cells.length < ncol) cells.push("");
         cells.length = ncol; // trim any overflow so the appended columns line up
-        return [...cells, t.dealer ?? "", t.potentialDealer ?? ""];
+        const m = t.match;
+        const suggested = t.tier === "likely" || t.tier === "possible";
+        return [
+          ...cells,
+          t.tier === "confirmed" ? m.dealer ?? "" : "",
+          suggested ? m.dealer ?? "" : "",
+          t.tier === "confirmed" || suggested ? String(m.score) : "",
+          t.tier === "confirmed" || suggested ? m.reason : "",
+          suggested ? m.candidates.slice(1, 4).map((c) => `${c.dealer} (${c.score}%)`).join("; ") : "",
+          t.account ?? "",
+        ];
       }),
     ];
     const ws = XLSX.utils.aoa_to_sheet(aoa);
@@ -189,7 +225,8 @@ export function ReconcileUploader({ mappings }: { mappings: Mapping[] }) {
   const FILTERS: { key: View; label: string }[] = [
     { key: "all", label: "All" },
     { key: "confirmed", label: "Confirmed" },
-    { key: "suggested", label: "Suggested" },
+    { key: "likely", label: "Likely" },
+    { key: "possible", label: "Possible" },
     { key: "unmapped", label: "Unmapped" },
     { key: "credit", label: "Credits" },
     { key: "debit", label: "Debits" },
@@ -204,7 +241,7 @@ export function ReconcileUploader({ mappings }: { mappings: Mapping[] }) {
             <option key={f} value={f}>{f}</option>
           ))}
         </select>
-        <span className="text-xs text-muted">Transactions are labelled from {firm}&apos;s UPI mappings.</span>
+        <span className="text-xs text-muted">Transactions are matched against {firm}&apos;s UPI IDs and payer accounts.</span>
       </div>
 
       <Card className="p-6 text-center border-2 border-dashed">
@@ -222,8 +259,9 @@ export function ReconcileUploader({ mappings }: { mappings: Mapping[] }) {
           </button>
         </div>
         <p className="mt-3 text-xs text-muted">
-          Read in your browser — nothing is uploaded. <span className="text-ink">Dealer</span> = exact UPI-ID match;
-          <span className="text-ink"> Potential dealer</span> = a suggestion matched by the number/username (needs your confirmation).
+          <span className="text-ink">Confirmed</span> = exact UPI ID or a known payer account.{" "}
+          <span className="text-ink">Likely / Possible</span> = a scored guess (e.g. a masked ID like ******3148 that fits a dealer&apos;s
+          UPI ID) — check it and press Confirm, and that payer is recognised from then on.
         </p>
         <div className="mt-2">
           <FormError message={error} />
@@ -232,17 +270,40 @@ export function ReconcileUploader({ mappings }: { mappings: Mapping[] }) {
 
       {summary && txns && (
         <>
-          <Section title={`${fileName} — ${txns.length} transactions`}>
-            <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
+          <Section title={`${fileName} — ${txns.length} transactions${summary.masked ? `, ${summary.masked} with masked UPI IDs` : ""}`}>
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
               <Stat label="Total credited" value={money(summary.credit)} tone="ok" />
               <Stat label="Total debited" value={money(summary.debit)} tone="danger" />
               <Stat label="Confirmed" value={`${summary.confirmed}`} />
-              <Stat label="Suggested" value={`${summary.suggested}`} tone={summary.suggested ? "warn" : undefined} />
-              <Stat label="Unmapped" value={`${summary.unmapped}`} tone={summary.unmapped ? "warn" : undefined} />
+              <Stat label="Likely (≥70%)" value={`${summary.likely}`} tone={summary.likely ? "warn" : undefined} />
+              <Stat label={`Possible (${minScore}–69%)`} value={`${summary.possible}`} tone={summary.possible ? "warn" : undefined} />
+              <Stat label="Unmapped" value={`${summary.unmapped}`} tone={summary.unmapped ? "danger" : undefined} />
             </div>
           </Section>
 
+          {learnable.length > 0 && (
+            <Card className="p-4">
+              <div className="flex flex-wrap items-center gap-3">
+                <p className="text-sm text-ink flex-1 min-w-[16rem]">
+                  This statement shows <span className="font-semibold">{learnable.length}</span> payer account
+                  {learnable.length === 1 ? "" : "s"} paying from UPI IDs you&apos;ve mapped. Save them so later statements — where the bank
+                  hides the UPI ID — match these payers automatically.
+                </p>
+                <button type="button" className={BTN} onClick={saveLearned} disabled={learning}>
+                  {learning ? "Saving…" : `Save ${learnable.length} account${learnable.length === 1 ? "" : "s"}`}
+                </button>
+              </div>
+              <div className="mt-2">
+                <FormError message={learnErr} />
+                {learnMsg && <FormOk message={learnMsg} />}
+              </div>
+            </Card>
+          )}
+
           <Section title="Transactions">
+            <datalist id={DEALER_LIST_ID}>
+              {dealerNames.map((d) => <option key={d} value={d} />)}
+            </datalist>
             <div className="mb-3 flex flex-wrap items-center gap-2">
               {FILTERS.map((f) => (
                 <button
@@ -256,11 +317,17 @@ export function ReconcileUploader({ mappings }: { mappings: Mapping[] }) {
                   {f.label}
                 </button>
               ))}
+              <label className="flex items-center gap-1 text-xs text-muted">
+                Suggest from
+                <select value={minScore} onChange={(e) => setMinScore(Number(e.target.value))} className="rounded border border-line bg-surface px-2 py-1 text-xs text-ink">
+                  {MIN_SCORES.map((s) => <option key={s} value={s}>{s}%</option>)}
+                </select>
+              </label>
               <input
                 type="search"
                 value={q}
                 onChange={(e) => setQ(e.target.value)}
-                placeholder="Search dealer, UPI ID, amount, narration…"
+                placeholder="Search dealer, UPI ID, account, amount…"
                 className="ml-auto w-full max-w-xs rounded-lg border border-line px-3 py-1.5 text-sm"
               />
               <button type="button" className={BTN_OUTLINE} onClick={exportExcel}>Download Excel</button>
@@ -273,25 +340,37 @@ export function ReconcileUploader({ mappings }: { mappings: Mapping[] }) {
                 head={
                   <tr>
                     <Th>Date</Th>
-                    <Th>UPI ID</Th>
+                    <Th>Payer</Th>
                     <Th>Dealer</Th>
-                    <Th>Potential dealer</Th>
-                    <Th>Type</Th>
                     <Th className="text-right">Amount</Th>
-                    <Th>Narration</Th>
+                    <Th>Check</Th>
                   </tr>
                 }
               >
                 {filtered.map((t, i) => (
                   <tr key={i}>
-                    <Td className="tabular whitespace-nowrap">{t.date}</Td>
-                    <Td className="tabular">{t.vpa ?? "—"}</Td>
-                    <Td>{t.dealer ? <span className="font-medium text-ink">{t.dealer}</span> : <span className="text-muted">—</span>}</Td>
-                    <Td>{t.potentialDealer ? <span className="text-[var(--color-warn)]">{t.potentialDealer}</span> : <span className="text-muted">—</span>}</Td>
-                    <Td>{t.credit > 0 ? <Badge tone="ok">Credit</Badge> : <Badge tone="neutral">Debit</Badge>}</Td>
-                    <Td className="tabular text-right">{money(t.credit > 0 ? t.credit : t.debit)}</Td>
-                    <Td className="text-muted text-xs">
-                      <span className="block max-w-md truncate" title={t.narration}>{t.narration}</span>
+                    <Td className="tabular whitespace-nowrap align-top">{t.date}</Td>
+                    <Td className="align-top">
+                      <div className="tabular" title={t.narration}>{t.vpa ?? <span className="text-muted text-xs">{t.narration}</span>}</div>
+                      {t.account && <div className="text-[11px] text-muted tabular">a/c {t.account}</div>}
+                    </Td>
+                    <Td className="align-top">
+                      <MatchCell t={t} />
+                    </Td>
+                    <Td className="tabular text-right whitespace-nowrap align-top">
+                      <span className={t.credit > 0 ? "text-[var(--color-ok)]" : "text-muted"}>
+                        {t.credit > 0 ? "+" : "−"}{money(t.credit > 0 ? t.credit : t.debit)}
+                      </span>
+                    </Td>
+                    <Td className="align-top">
+                      {t.vpa && t.tier !== "confirmed" && (
+                        <ConfirmCell
+                          key={`${t.date}-${t.narration}-${t.match.dealer ?? ""}`}
+                          t={t}
+                          firm={firm}
+                          onConfirmed={onConfirmed}
+                        />
+                      )}
                     </Td>
                   </tr>
                 ))}
@@ -300,6 +379,91 @@ export function ReconcileUploader({ mappings }: { mappings: Mapping[] }) {
           </Section>
         </>
       )}
+    </div>
+  );
+}
+
+function MatchCell({ t }: { t: Txn }) {
+  const m = t.match;
+  if (t.tier === "not-upi") return <span className="text-muted">—</span>;
+  if (t.tier === "unmapped") {
+    return (
+      <div>
+        <span className="text-muted">Unmapped</span>
+        {m.status === "suggested" && (
+          <div className="text-[11px] text-muted">best guess {m.dealer} ({m.score}%) is below your threshold</div>
+        )}
+      </div>
+    );
+  }
+  const tone = t.tier === "confirmed" ? "ok" : t.tier === "likely" ? "info" : "warn";
+  const label = t.tier === "confirmed" ? "Confirmed" : `${t.tier === "likely" ? "Likely" : "Possible"} ${m.score}%`;
+  return (
+    <div className="max-w-sm">
+      <div className="flex flex-wrap items-center gap-1.5">
+        <span className={t.tier === "confirmed" ? "font-medium text-ink" : "font-medium text-[var(--color-warn)]"}>{m.dealer}</span>
+        <Badge tone={tone}>{label}</Badge>
+      </div>
+      <div className="text-[11px] text-muted">{m.reason}</div>
+    </div>
+  );
+}
+
+/** Check a guess: accept it, pick a runner-up, or type the right dealer. */
+function ConfirmCell({
+  t, firm, onConfirmed,
+}: {
+  t: Txn;
+  firm: Firm;
+  onConfirmed: (dealer: string, account: string | null, vpa: string | null, savedVpa: boolean) => void;
+}) {
+  const suggested = t.tier === "likely" || t.tier === "possible";
+  const [dealer, setDealer] = useState(suggested ? t.match.dealer ?? "" : "");
+  const [error, setError] = useState<string>();
+  const [pending, start] = useTransition();
+  const others = suggested ? t.match.candidates.slice(1, 4) : [];
+
+  function confirm() {
+    setError(undefined);
+    const vpa = t.vpa && !isMaskedVpa(t.vpa) ? t.vpa : null;
+    start(async () => {
+      const res = await confirmMatch({ firm, dealer_name: dealer, payer_account: t.account, upi_id: vpa });
+      if (res.error) setError(res.error);
+      else onConfirmed(dealer.trim(), res.savedAccount ? t.account : null, vpa, !!res.savedVpa);
+    });
+  }
+
+  return (
+    <div className="min-w-[14rem]">
+      <div className="flex items-center gap-1">
+        <input
+          value={dealer}
+          onChange={(e) => setDealer(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && confirm()}
+          list={DEALER_LIST_ID}
+          placeholder="Dealer…"
+          className="w-full rounded border border-line px-2 py-1 text-xs"
+        />
+        <button type="button" className={BTN_SM} onClick={confirm} disabled={pending || !dealer.trim()}>
+          {pending ? "…" : "Confirm"}
+        </button>
+      </div>
+      {others.length > 0 && (
+        <div className="mt-1 flex flex-wrap gap-1">
+          {others.map((c) => (
+            <button
+              key={c.dealer}
+              type="button"
+              title={c.reason}
+              onClick={() => setDealer(c.dealer)}
+              className="rounded-full border border-line px-2 py-0.5 text-[11px] text-muted hover:bg-[var(--color-surface-2)]"
+            >
+              {c.dealer} {c.score}%
+            </button>
+          ))}
+        </div>
+      )}
+      {error && <div className="mt-1 text-[11px] text-[var(--color-danger)]">{error}</div>}
     </div>
   );
 }

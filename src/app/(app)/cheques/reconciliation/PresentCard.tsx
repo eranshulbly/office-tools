@@ -19,10 +19,17 @@ export function PresentCard({
   item,
   accounts,
   defaultDate,
+  canEdit = true,
 }: {
   item: PresentItem;
   accounts: PresentAccount[];
   defaultDate: string;
+  /**
+   * Editing a cheque's fields is admin-only — it goes through
+   * admin_update_cheque, which rejects any other role. Passing false hides the
+   * affordance so an ops manager isn't offered an action that would fail.
+   */
+  canEdit?: boolean;
 }) {
   const [editing, setEditing] = useState(false);
   return (
@@ -48,10 +55,10 @@ export function PresentCard({
           accounts={accounts}
           defaultAccountId={item.defaultAccountId}
           defaultDate={defaultDate}
-          onEdit={() => setEditing(true)}
+          onEdit={canEdit ? () => setEditing(true) : undefined}
         />
       </div>
-      {editing && (
+      {canEdit && editing && (
         <ChequeEditModal id={item.id} initial={item.fields} onClose={() => setEditing(false)} />
       )}
     </Card>

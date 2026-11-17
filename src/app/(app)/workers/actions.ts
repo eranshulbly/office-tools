@@ -13,7 +13,13 @@ export type WorkerFormState = { error?: string };
 
 type ParsedWorker = {
   full_name: string;
-  monthly_salary: number;
+  designation: string | null;
+  /**
+   * null means the box was left empty, which is NOT the same as zero.
+   * `Number("")` is 0, and writing that over somebody's pay would be the
+   * quietest possible way to wreck a payroll run.
+   */
+  monthly_salary: number | null;
   joined_on: string;
   left_on: string | null;
   is_active: boolean;
@@ -108,9 +114,11 @@ function parseWorker(formData: FormData): ParsedWorker {
   const left_on = str(formData, "left_on");
   const group_id = str(formData, "group_id");
   const phone = str(formData, "phone");
+  const salaryRaw = str(formData, "monthly_salary");
   return {
     full_name: str(formData, "full_name"),
-    monthly_salary: Number(str(formData, "monthly_salary")),
+    designation: str(formData, "designation") || null,
+    monthly_salary: salaryRaw === "" ? null : Number(salaryRaw),
     bank_account: bank_account || null,
     bank_ifsc: bank_ifsc || null,
     joined_on: str(formData, "joined_on"),
@@ -121,17 +129,30 @@ function parseWorker(formData: FormData): ParsedWorker {
   };
 }
 
+const SALARY_ERROR = "Monthly salary must be a whole number of rupees greater than 0.";
+
 /**
- * Field-level validation — same mandatory fields for create AND edit: full name,
- * a positive monthly salary, phone, group, and joined-on. (Employee code is auto/
- * fixed; the device PIN isn't collected here.)
+ * Salary is whole rupees. Paise were never used — every salary on file is a
+ * round figure — and allowing them invited a stray decimal point to turn
+ * 25000 into 250.00. The form blocks the decimal point, and this is the check
+ * that actually holds, since the form's pattern is only a hint.
  */
-function validate(v: ParsedWorker): string | null {
+function salaryError(v: number | null): string | null {
+  return v != null && Number.isInteger(v) && v > 0 ? null : SALARY_ERROR;
+}
+
+/**
+ * Validation for CREATE — the full set: full name, a positive monthly salary,
+ * phone, group, and joined-on. (Employee code is auto/fixed; the device PIN
+ * isn't collected here.) A new employee is the one moment all of this is to
+ * hand, so it is worth asking for it then.
+ */
+function validateCreate(v: ParsedWorker): string | null {
   if (!v.full_name) return "Full name is required.";
   const nErr = nameError(v.full_name);
   if (nErr) return nErr;
-  if (!Number.isFinite(v.monthly_salary) || v.monthly_salary <= 0)
-    return "Monthly salary must be a number greater than 0.";
+  const sErr = salaryError(v.monthly_salary);
+  if (sErr) return sErr;
   if (!v.phone) return "Phone number is required.";
   const pErr = phoneError(v.phone);
   if (pErr) return pErr;
@@ -140,12 +161,42 @@ function validate(v: ParsedWorker): string | null {
   return joinedOnError(v.joined_on);
 }
 
+/**
+ * Validation for EDIT — NOTHING is mandatory.
+ *
+ * Every field on this form is optional, including the salary. Requiring even
+ * one of them blocked the whole form for most of the roster: the records were
+ * imported without a phone (all 122 of them), without a group (113), and 28
+ * still have no salary. Someone opening a record to fix a designation was
+ * being told to invent a salary first, so nothing could be edited at all.
+ *
+ * Optional does NOT mean unchecked: anything actually filled in is still held
+ * to the same format rules, so a blank stays blank but a typo is still caught.
+ * A blank leaves the stored value alone — see the patch built in updateWorker.
+ */
+function validateEdit(v: ParsedWorker): string | null {
+  if (v.monthly_salary != null) {
+    const sErr = salaryError(v.monthly_salary);
+    if (sErr) return sErr;
+  }
+  if (v.full_name) {
+    const nErr = nameError(v.full_name);
+    if (nErr) return nErr;
+  }
+  if (v.phone) {
+    const pErr = phoneError(v.phone);
+    if (pErr) return pErr;
+  }
+  if (v.joined_on) return joinedOnError(v.joined_on);
+  return null;
+}
+
 export async function createWorker(
   _prev: WorkerFormState,
   formData: FormData
 ): Promise<WorkerFormState> {
   const values = parseWorker(formData);
-  const invalid = validate(values);
+  const invalid = validateCreate(values);
   if (invalid) return { error: invalid };
 
   const supabase = await createSupabaseServerClient();
@@ -155,6 +206,7 @@ export async function createWorker(
     .from("workers")
     .insert({
       full_name: values.full_name,
+      designation: values.designation,
       monthly_salary: values.monthly_salary,
       joined_on: values.joined_on,
       left_on: values.left_on,
@@ -185,7 +237,7 @@ export async function updateWorker(
   if (!id) return { error: "Missing employee id." };
 
   const values = parseWorker(formData);
-  const invalid = validate(values);
+  const invalid = validateEdit(values);
   if (invalid) return { error: invalid };
 
   // Making an employee inactive with no leaving date → record today as the date.
@@ -202,18 +254,28 @@ export async function updateWorker(
   const supabase = await createSupabaseServerClient();
   // employee_code and device PIN are intentionally NOT updated here (code is
   // fixed; PIN isn't managed in this form) — they're left untouched.
-  const { error } = await supabase
-    .from("workers")
-    .update({
-      full_name: values.full_name,
-      monthly_salary: values.monthly_salary,
-      joined_on: values.joined_on,
-      left_on: values.left_on,
-      is_active: values.is_active,
-      group_id: values.group_id,
-      phone: values.phone,
-    })
-    .eq("id", id);
+  const patch: Record<string, unknown> = {
+    designation: values.designation,
+    left_on: values.left_on,
+    is_active: values.is_active,
+    // Nullable columns: clearing the box genuinely clears the value, which is
+    // the only way to remove a wrong phone number or un-assign a group.
+    group_id: values.group_id,
+    phone: values.phone,
+  };
+
+  // full_name, joined_on and monthly_salary are all optional on this form now,
+  // and for these three "left blank" has to mean "leave it alone".
+  //
+  // The first two are NOT NULL in the database, so a blank would either breach
+  // the constraint or wipe a real name — and there is no way to express "no
+  // name" for an employee anyway. Salary is nullable, but a blank box means
+  // "I am not editing pay", never "set this person's pay to nothing".
+  if (values.full_name) patch.full_name = values.full_name;
+  if (values.joined_on) patch.joined_on = values.joined_on;
+  if (values.monthly_salary != null) patch.monthly_salary = values.monthly_salary;
+
+  const { error } = await supabase.from("workers").update(patch).eq("id", id);
   if (error) return { error: error.message };
 
   const bankErr = await saveBankDetails(id, values);
@@ -318,16 +380,26 @@ export async function requestWorkerEdit(
   const left_on = str(formData, "left_on");
   const phone = str(formData, "phone");
 
-  // Same mandatory fields as the new-employee form. Employee code (fixed) and the
+  // Nothing is mandatory here, unlike the new-employee form. Every employee on
+  // file is missing a phone and most are missing a group, so requiring either
+  // one made this form refuse every record it was opened on. A field left
+  // blank is simply not part of the request.
+  //
+  // Formats are still enforced on whatever IS filled in, so a blank stays
+  // blank but a mistyped number is still caught. Employee code (fixed) and the
   // device PIN are never edited here.
-  if (!full_name) return { error: "Full name is required." };
-  const nErr = nameError(full_name);
-  if (nErr) return { error: nErr };
-  if (!phone) return { error: "Phone number is required." };
-  const pErr = phoneError(phone);
-  if (pErr) return { error: pErr };
-  if (!group_id) return { error: "Please choose a group." };
-  if (!joined_on) return { error: "Joined on date is required." };
+  if (full_name) {
+    const nErr = nameError(full_name);
+    if (nErr) return { error: nErr };
+  }
+  if (phone) {
+    const pErr = phoneError(phone);
+    if (pErr) return { error: pErr };
+  }
+  if (joined_on) {
+    const jErr = joinedOnError(joined_on);
+    if (jErr) return { error: jErr };
+  }
   const is_active = formData.get("is_active") != null;
 
   const supabase = await createSupabaseServerClient();
@@ -345,10 +417,15 @@ export async function requestWorkerEdit(
   const effectiveLeftOn = !is_active && !left_on ? todayIST() : left_on;
 
   const payload: Record<string, string | boolean> = {};
-  if (full_name !== (cur.full_name ?? "")) payload.full_name = full_name;
+  // full_name and joined_on are NOT NULL on the workers table, and the approving
+  // RPC skips a blank for both (`if (str(p.full_name))`). Submitting one anyway
+  // would show the admin a change that silently does nothing on approval, so a
+  // blank is left out of the request entirely rather than proposed as a clear.
+  if (full_name && full_name !== (cur.full_name ?? "")) payload.full_name = full_name;
+  if (joined_on && joined_on !== (cur.joined_on ?? "")) payload.joined_on = joined_on;
+  // Group and phone are nullable, so clearing either is a real, intended edit.
   if (group_id !== (cur.group_id ?? "")) payload.group_id = group_id;
   if (phone !== (cur.phone ?? "")) payload.phone = phone;
-  if (joined_on !== (cur.joined_on ?? "")) payload.joined_on = joined_on;
   if (effectiveLeftOn !== (cur.left_on ?? "")) payload.left_on = effectiveLeftOn;
   if (is_active !== !!cur.is_active) payload.is_active = is_active;
 

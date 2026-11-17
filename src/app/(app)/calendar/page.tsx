@@ -1,4 +1,4 @@
-import { requireRole } from "@/lib/auth";
+import { requireFeature } from "@/lib/auth";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import type { CalendarDayType } from "@/lib/types";
 import { PageHeader, Section, LinkButton } from "@/components/ui";
@@ -30,7 +30,7 @@ export default async function CalendarPage({
 }: {
   searchParams: Promise<{ month?: string }>;
 }) {
-  await requireRole("admin");
+  await requireFeature("calendar");
   const sp = await searchParams;
   const month = sp.month && MONTH_RE.test(sp.month) ? sp.month : currentMonth();
 

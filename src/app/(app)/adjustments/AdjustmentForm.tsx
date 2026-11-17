@@ -3,6 +3,7 @@
 import { useActionState, useEffect, useRef, useState } from "react";
 import { Button, FormError, FormOk } from "@/components/ui";
 import { SearchableSelect } from "@/components/SearchableSelect";
+import { ADJUSTMENT_REASONS } from "@/lib/adjustments";
 import { requestAdjustment, type AdjustmentFormState } from "./actions";
 
 const inputClass = "mt-1 w-full rounded-lg border border-line px-3 py-2.5 text-sm";
@@ -14,7 +15,9 @@ const initial: AdjustmentFormState = {};
 // Sensible defaults so the form is submittable as-is: today, 9 AM in, 8 PM out.
 const DEFAULT_IN_HOUR = "09:00";
 const DEFAULT_OUT_HOUR = "20:00";
-const DEFAULT_REASON = "Biometric punch missed — manual entry";
+// No option is pre-selected: the reason drives what happens to the request, so
+// it should be a choice someone made, not whichever one happened to be first.
+const DEFAULT_REASON = "";
 
 function todayStr(): string {
   const d = new Date();
@@ -112,14 +115,22 @@ export function AdjustmentForm({ workers }: { workers: WorkerOption[] }) {
 
       <div>
         <label className="text-sm font-medium text-ink">Reason (required)</label>
-        <textarea
+        <select
           name="reason"
           required
-          rows={3}
           value={reason}
           onChange={(e) => setReason(e.target.value)}
           className={inputClass}
-        />
+        >
+          <option value="" disabled>
+            — select a reason —
+          </option>
+          {ADJUSTMENT_REASONS.map((r) => (
+            <option key={r} value={r}>
+              {r}
+            </option>
+          ))}
+        </select>
       </div>
 
       <Button type="submit" variant="primary" disabled={pending}>

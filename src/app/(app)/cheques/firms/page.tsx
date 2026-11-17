@@ -1,4 +1,4 @@
-import { requireRole } from "@/lib/auth";
+import { requireSuite } from "@/lib/auth";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { PageHeader } from "@/components/ui";
 import { listFirms, belongsToFirm, getActiveFirm } from "@/lib/firm";
@@ -18,7 +18,10 @@ export const dynamic = "force-dynamic";
  * people to, and doing so would loop.
  */
 export default async function FirmsPage() {
-  await requireRole("admin", "manager");
+  // Not a feature of its own, so it is guarded at suite level: every role with
+  // at least one cheque tab may pick a firm. requireFirm() redirects here, so
+  // excluding a role would deadlock it out of the suite entirely.
+  await requireSuite("cheque");
 
   const [firms, active, supabase] = await Promise.all([
     listFirms(),

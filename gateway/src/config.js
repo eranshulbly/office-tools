@@ -17,8 +17,15 @@ function required(key) {
 export const config = {
   port: Number(process.env.GATEWAY_PORT || 8080),
 
-  supabaseUrl: required("SUPABASE_URL"),
-  serviceKey: required("SUPABASE_SERVICE_ROLE_KEY"),
+  // MySQL on RDS — the same database the app uses. Replaces the Supabase
+  // service-role client the gateway used before the migration.
+  databaseUrl: required("DATABASE_URL"),
+
+  // recompute_attendance is no longer a database function; it was ported to
+  // TypeScript inside the Next.js app. The gateway therefore asks the app to
+  // rebuild the affected days over localhost HTTP after inserting punches.
+  recomputeUrl: process.env.RECOMPUTE_URL || "http://127.0.0.1:3000/api/internal/recompute",
+  recomputeSecret: process.env.GATEWAY_SHARED_SECRET || "",
 
   // The K40 Pro sends naive local timestamps ("2026-07-13 08:47:31"). We attach
   // this offset to turn them into unambiguous instants. The device clock MUST be

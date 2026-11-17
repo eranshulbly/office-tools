@@ -1,4 +1,4 @@
-import { requireRole } from "@/lib/auth";
+import { requireFeature } from "@/lib/auth";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { PageHeader, Section, Table, Th, Td, Button, Empty, money } from "@/components/ui";
 import { WorkerAvatar } from "@/components/WorkerAvatar";
@@ -37,14 +37,14 @@ function fmtTs(ts: string | null): string {
 }
 
 export default async function AdvanceApprovalsPage() {
-  await requireRole("admin");
+  await requireFeature("advance-approvals");
   const supabase = await createSupabaseServerClient();
 
   const { data: advData, error: advError } = await supabase
     .from("advances")
     .select(
       "id, worker_id, amount, reason, requested_at, " +
-        "worker:workers(full_name, monthly_salary, photo_path), " +
+        "worker:workers(full_name, employee_code, designation, monthly_salary, photo_path), " +
         "requester:profiles!requested_by(full_name)"
     )
     .eq("status", "pending")

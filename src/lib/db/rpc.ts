@@ -1,6 +1,7 @@
 import type { PoolConnection } from "mysql2/promise";
 import { transaction, query } from "./pool";
 import type { Row } from "./builder";
+import { pushWorkerToDevices, removeWorkerFromDevices } from "@/lib/device";
 
 /**
  * Ported Postgres RPCs.
@@ -22,7 +23,18 @@ import type { Row } from "./builder";
  * unported name fails loudly instead of silently doing nothing.
  */
 
-type Ctx = { conn: PoolConnection; userId: string | null };
+/**
+ * `afterCommit` holds side effects that must run only once the transaction has
+ * actually landed — pushing an employee to the attendance terminals, say.
+ * Doing that work inside the transaction would hold a database connection open
+ * on a network call, and a terminal being unreachable would roll back a change
+ * that was otherwise perfectly good.
+ */
+type Ctx = {
+  conn: PoolConnection;
+  userId: string | null;
+  afterCommit: Array<() => Promise<void>>;
+};
 
 const IMPLEMENTED = new Set([
   // cheques
@@ -37,6 +49,7 @@ const IMPLEMENTED = new Set([
   "decide_adjustment",
   "decide_late_review",
   "admin_set_device_pin",
+  "admin_set_attendance",
   "admin_auto_settle_cheque",
   "unlinked_punch_pins",
   // advances
@@ -81,10 +94,32 @@ async function requireAdmin(ctx: Ctx, fn: string): Promise<void> {
   }
 }
 
+/**
+ * The roles that run HR day to day: a manager, or an HR ops manager.
+ *
+ * The worker request/edit RPCs were written as `role !== "manager"`. Adding a
+ * second HR role means that test has to name both, or the new role silently
+ * loses half of what it exists to do.
+ */
+function isHrStaff(role: string | null): boolean {
+  return role === "manager" || role === "ops_manager_hr";
+}
+
 async function requireStaff(ctx: Ctx, fn: string): Promise<void> {
   if (ctx.userId === null) return;
   const r = await roleOf(ctx.conn, ctx.userId);
   if (r !== "admin" && r !== "manager") throw new Error(`${fn}: staff only`);
+}
+
+/**
+ * Admin, or an ops manager — the two roles allowed to capture a cheque and hand
+ * it to the bank. Used only by create/submit/present; every other cheque action
+ * (outcomes, auto-settle, edits) stays admin-only.
+ */
+async function requireChequeHandler(ctx: Ctx, fn: string): Promise<void> {
+  if (ctx.userId === null) return;
+  const r = await roleOf(ctx.conn, ctx.userId);
+  if (r !== "admin" && r !== "ops_manager") throw new Error(`${fn}: not permitted for this role`);
 }
 
 async function writeAudit(
@@ -121,6 +156,9 @@ async function writeAudit(
 async function canDisburseGroup(ctx: Ctx, groupId: string | null): Promise<boolean> {
   if (ctx.userId === null) return true; // trusted server-side caller
   if ((await roleOf(ctx.conn, ctx.userId)) === "admin") return true;
+  // No group snapshot: fail closed rather than guess. Note this also means an
+  // UNGROUPED worker cannot be edited by anyone but an admin — true for
+  // managers today, and true for ops_manager_hr for the same reason.
   if (!groupId) return false;
 
   const [rows] = await ctx.conn.query(
@@ -226,7 +264,7 @@ async function warehouseTz(conn: PoolConnection): Promise<string> {
  * silently shift punches near midnight into the wrong day.
  */
 function zoned(utc: string | Date, tz: string): { date: string; time: string } {
-  const d = utc instanceof Date ? utc : new Date(String(utc).replace(" ", "T") + "Z");
+  const d = utc instanceof Date ? utc : toUtcDate(utc);
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit",
     hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
@@ -238,8 +276,71 @@ function zoned(utc: string | Date, tz: string): { date: string; time: string } {
   };
 }
 
-const toUtcDate = (s: string): Date => new Date(String(s).replace(" ", "T") + "Z");
+/**
+ * A DATETIME value from the database as a Date.
+ *
+ * Two shapes reach this: the pool's typeCast hands DATETIME/TIMESTAMP back as
+ * ISO-8601 UTC ("2026-09-01T04:24:39.000000Z"), while a literal built in code
+ * is the bare MySQL form with no zone at all. Both mean UTC — every DATETIME
+ * column here holds UTC by contract.
+ *
+ * Appending "Z" unconditionally, as this used to, turned the first shape into
+ * "...ZZ" -> Invalid Date. That threw "Invalid time value" out of every
+ * recompute of a working day, so attendance silently stopped being built while
+ * punches kept arriving. Normalise to exactly one marker instead.
+ */
+function toUtcDate(s: string | Date): Date {
+  if (s instanceof Date) return s;
+  let iso = String(s).trim().replace(" ", "T");
+  while (iso.endsWith("Z") || iso.endsWith("z")) iso = iso.slice(0, -1);
+  return new Date(iso + "Z");
+}
 const toSqlDt = (d: Date): string => d.toISOString().slice(0, 23).replace("T", " ");
+
+/**
+ * The departure time, or null when there isn't one yet.
+ *
+ * A lone punch is an arrival. Reporting it as last_out too made the grid read
+ * as though the person clocked in and straight back out at the same instant,
+ * and it produced a 0.00-hour day. last_out stays empty until a second,
+ * genuinely later punch lands.
+ */
+function departure(first: Date | null, last: Date | null): Date | null {
+  return first && last && last.getTime() > first.getTime() ? last : null;
+}
+
+/**
+ * The UTC instant at which the warehouse clock reads `day` at `hhmm`.
+ *
+ * The inverse of zoned(). Guess the instant as though the zone were UTC, ask
+ * zoned() where that guess actually lands, and subtract the difference. One
+ * correction is exact for a fixed-offset zone, which Asia/Kolkata is.
+ */
+function localToUtc(day: string, hhmm: string, tz: string): Date {
+  const t = hhmm.length === 5 ? hhmm + ":00" : hhmm;
+  const guess = new Date(day + "T" + t + "Z");
+  const z = zoned(guess, tz);
+  const drift = Date.parse(z.date + "T" + z.time + "Z") - guess.getTime();
+  return new Date(guess.getTime() - drift);
+}
+
+/**
+ * Groups whose people are not expected to punch out — drivers and delivery
+ * helpers leave on a run and do not come back past the terminal.
+ *
+ * Held as a comma-separated list of group names in settings rather than a
+ * column on worker_groups, so an admin can change the policy from the settings
+ * page without a migration.
+ */
+async function punchInOnlyGroups(conn: PoolConnection): Promise<Set<string>> {
+  const raw = (await settingRaw(conn, "punch_in_only_groups")) ?? "";
+  return new Set(
+    raw
+      .split(",")
+      .map((n) => n.trim().toLowerCase())
+      .filter(Boolean)
+  );
+}
 
 /** Port of dedupe_punch_times(): collapse finger-retries inside the window. */
 async function dedupePunchTimes(
@@ -248,13 +349,34 @@ async function dedupePunchTimes(
   const [wrows] = await conn.query("SELECT device_user_id FROM workers WHERE id = ?", [workerId]);
   const pin = (wrows as { device_user_id: number | null }[])[0]?.device_user_id ?? null;
 
-  // Includes unlinked punches from this worker's terminal PIN, as the original
-  // did — the PIN is unique, so they can only be this person.
+  /**
+   * Whose punch is it? The PIN decides.
+   *
+   * raw_punches.worker_id is a CONVENIENCE the gateway stamps on at insert
+   * time from its PIN->worker map. workers.device_user_id is the mapping of
+   * record. When the two disagree the stored value is simply stale, and it
+   * cannot be corrected in place: raw_punches is append-only by trigger, which
+   * is right — it is the device's own record and must not be rewritten.
+   *
+   * That staleness was not hypothetical. A terminal PIN enrolled to one person
+   * while the app had it mapped to another credited a month of someone else's
+   * attendance to them, and no amount of correcting the mapping helped,
+   * because the old worker_id kept winning.
+   *
+   * So:
+   *   - a worker with a PIN gets exactly the punches made on that PIN;
+   *   - a punch tagged to a worker still counts for them IF nobody currently
+   *     holds its PIN — which keeps the history of someone whose PIN was
+   *     cleared, without letting it follow them once the PIN is reassigned.
+   */
   const [rows] = await conn.query(
-    `SELECT device_ts FROM raw_punches
-      WHERE (worker_id = ? OR (worker_id IS NULL AND ? IS NOT NULL AND device_user_id = ?))
+    `SELECT device_ts FROM raw_punches p
+      WHERE (? IS NOT NULL AND p.device_user_id = ?)
+         OR (p.worker_id = ?
+             AND NOT EXISTS (SELECT 1 FROM workers w2
+                              WHERE w2.device_user_id = p.device_user_id))
       ORDER BY device_ts`,
-    [workerId, pin, pin]
+    [pin, pin, workerId]
   );
 
   const kept: Date[] = [];
@@ -282,6 +404,12 @@ async function recomputeAttendance(ctx: Ctx, fromDate: string, toDate: string): 
   const vWin = await settingNum(conn, "dedupe_window_minutes");
   const tz = await warehouseTz(conn);
 
+  const outOnlyGroups = await punchInOnlyGroups(conn);
+  const defaultOutRaw = (await settingRaw(conn, "punch_in_only_default_out")) ?? "20:00";
+  const defaultOut = /^([01]?\d|2[0-3]):[0-5]\d(:[0-5]\d)?$/.test(defaultOutRaw)
+    ? defaultOutRaw
+    : "20:00";
+
   const cutoffRaw = await settingRaw(conn, "late_first_punch_cutoff");
   const cutoff = /^([01]?\d|2[0-3]):[0-5]\d(:[0-5]\d)?$/.test(cutoffRaw ?? "")
     ? (cutoffRaw as string).length === 5 ? `${cutoffRaw}:00` : (cutoffRaw as string)
@@ -294,12 +422,14 @@ async function recomputeAttendance(ctx: Ctx, fromDate: string, toDate: string): 
     const calType = (cal as { day_type: string }[])[0]?.day_type ?? "working";
 
     const [ws] = await conn.query(
-      `SELECT id FROM workers
-        WHERE is_active = 1 AND joined_on <= ? AND (left_on IS NULL OR left_on >= ?)`,
+      `SELECT w.id, g.name AS group_name
+         FROM workers w
+         LEFT JOIN worker_groups g ON g.id = w.group_id
+        WHERE w.is_active = 1 AND w.joined_on <= ? AND (w.left_on IS NULL OR w.left_on >= ?)`,
       [day, day]
     );
 
-    for (const w of ws as { id: string }[]) {
+    for (const w of ws as { id: string; group_name: string | null }[]) {
       let fromAdj = false;
       let first: Date | null = null;
       let last: Date | null = null;
@@ -321,29 +451,63 @@ async function recomputeAttendance(ctx: Ctx, fromDate: string, toDate: string): 
 
         if (adj) {
           fromAdj = true;
-          const set = [...kept];
+          // A correction giving BOTH ends is authoritative: those two times ARE
+          // the day, and the device's punches are not merged in. Without that
+          // an admin could never shorten a day — the real punches would widen
+          // the span straight back out, so marking somebody absent was
+          // impossible however the times were edited.
+          //
+          // A one-sided correction still unions with the punches: that is the
+          // forgot-punch case ("clocked in, never clocked out"), where the
+          // punch on file is exactly the half worth keeping.
+          const set = adj.proposed_in && adj.proposed_out ? [] : [...kept];
           if (adj.proposed_in) set.push(toUtcDate(String(adj.proposed_in)));
           if (adj.proposed_out) set.push(toUtcDate(String(adj.proposed_out)));
           if (set.length) {
             first = new Date(Math.min(...set.map((t) => t.getTime())));
-            last = new Date(Math.max(...set.map((t) => t.getTime())));
-            hours = Math.max((last.getTime() - first.getTime()) / 3_600_000 - vBreak / 60, 0);
+            last = departure(first, new Date(Math.max(...set.map((t) => t.getTime()))));
+            if (last) {
+              hours = Math.max((last.getTime() - first.getTime()) / 3_600_000 - vBreak / 60, 0);
+            }
           }
           status = hours != null && hours >= vFull ? "full_day" : "absent";
         } else if (kept.length === 0) {
           status = "absent";
         } else {
           first = kept[0];
-          last = kept[kept.length - 1];
+          last = departure(first, kept[kept.length - 1]);
 
-          if (zoned(first, tz).time > cutoff) {
+          // Punch-in-only groups: drivers and their helpers leave on a run and
+          // do not pass the terminal again, so requiring a second punch would
+          // mark a full day's work absent. Arriving is the whole record — the
+          // day closes at a fixed hour and counts as present.
+          //
+          // A real punch LATER than that hour still wins: someone who did come
+          // back and punch out at 21:00 worked until 21:00, and the default
+          // must not shorten a genuine day.
+          const outOnly =
+            outOnlyGroups.size > 0 &&
+            outOnlyGroups.has((w.group_name ?? "").toLowerCase());
+          const closeAt = outOnly ? localToUtc(day, defaultOut, tz) : null;
+
+          if (closeAt && closeAt.getTime() > first.getTime()) {
+            if (!last || last.getTime() < closeAt.getTime()) last = closeAt;
+            hours = Math.max((last.getTime() - first.getTime()) / 3_600_000 - vBreak / 60, 0);
+            // Present because they turned up, not because the span is long
+            // enough — the span here is a convention, not a measurement.
+            status = "full_day";
+          } else if (zoned(first, tz).time > cutoff) {
             const [lr] = await conn.query(
               "SELECT status FROM late_arrival_reviews WHERE worker_id = ? AND day = ?",
               [w.id, day]
             );
             const review = (lr as { status: string }[])[0]?.status;
             if (review === "approved") {
-              hours = Math.max((last.getTime() - first.getTime()) / 3_600_000 - vBreak / 60, 0);
+              // Hours stay unknown until they punch out; the approval itself
+              // is what grants the day, not the elapsed time.
+              if (last) {
+                hours = Math.max((last.getTime() - first.getTime()) / 3_600_000 - vBreak / 60, 0);
+              }
               status = "full_day";
             } else if (review === "rejected") {
               status = "absent";
@@ -353,7 +517,9 @@ async function recomputeAttendance(ctx: Ctx, fromDate: string, toDate: string): 
           } else if (kept.length === 1) {
             status = "unresolved"; // dangling punch, not late
           } else {
-            hours = Math.max((last.getTime() - first.getTime()) / 3_600_000 - vBreak / 60, 0);
+            hours = last
+              ? Math.max((last.getTime() - first.getTime()) / 3_600_000 - vBreak / 60, 0)
+              : 0;
             status = hours >= vFull ? "full_day" : "absent";
           }
         }
@@ -389,7 +555,13 @@ function today(): string {
 const REGISTRY: Record<string, (ctx: Ctx, args: Row) => Promise<unknown>> = {
   async create_cheque(ctx, args) {
     const p = (args.p ?? {}) as Row;
-    await requireStaff(ctx, "create_cheque");
+    // admin, manager or ops_manager — all three capture cheques.
+    if (ctx.userId !== null) {
+      const r = await roleOf(ctx.conn, ctx.userId);
+      if (r !== "admin" && r !== "manager" && r !== "ops_manager") {
+        throw new Error("create_cheque: staff only");
+      }
+    }
     const id = uuid();
     const src = (p.extraction_source as string)?.trim() || "manual";
     await ctx.conn.query(
@@ -450,7 +622,9 @@ const REGISTRY: Record<string, (ctx: Ctx, args: Row) => Promise<unknown>> = {
   },
 
   async record_cheque_presented(ctx, args) {
-    await requireAdmin(ctx, "record_cheque_presented");
+    // Widened from admin-only: handing a cheque to the bank is exactly what an
+    // ops manager exists to do. Marking the OUTCOME stays admin-only.
+    await requireChequeHandler(ctx, "record_cheque_presented");
     const id = args.p_id as string;
     const bank = (args.p_bank_account ?? null) as string | null;
     const date = (args.p_date as string) || today();
@@ -530,7 +704,24 @@ const REGISTRY: Record<string, (ctx: Ctx, args: Row) => Promise<unknown>> = {
         WHERE id = ?`,
       [approve ? "approved" : "rejected", ctx.userId, reason, id]
     );
-    await writeAudit(ctx, approve ? "adjustment_approved" : "adjustment_rejected", "adjustments", id,
+
+    /**
+     * `p_auto` marks a self-approval (see the auto-approve sweep). It changes
+     * ONLY the audit action — every column a manager can see is written
+     * identically to a human approval, deliberately. The whole point is that a
+     * manager cannot tell which reasons approve themselves; if they could,
+     * they would pick that one every time.
+     *
+     * audit_log is admin-only, so this stays a record admins can audit for
+     * misuse without leaking the mechanism to the people using it.
+     */
+    const auto = Boolean(args.p_auto);
+    const action = approve
+      ? auto
+        ? "adjustment_auto_approved"
+        : "adjustment_approved"
+      : "adjustment_rejected";
+    await writeAudit(ctx, action, "adjustments", id,
       { status: "pending" }, { status: approve ? "approved" : "rejected" }, reason);
 
     // Approval affects attendance immediately; rebuild just that day.
@@ -582,11 +773,98 @@ const REGISTRY: Record<string, (ctx: Ctx, args: Row) => Promise<unknown>> = {
     return null;
   },
 
+  /**
+   * Admin sets an employee's IN/OUT for one day, directly.
+   *
+   * Until now the only way to correct a day was for a MANAGER to raise an
+   * adjustment and an ADMIN to approve it. An admin looking at a wrong day had
+   * no way to fix it themselves, which is the gap this closes.
+   *
+   * It writes an already-approved adjustment rather than touching
+   * attendance_days: recompute_attendance is the single writer of that table,
+   * and going around it would produce a row the next recompute silently
+   * reverts. Present or absent therefore still FOLLOWS from the times, exactly
+   * as it does for a real pair of punches.
+   *
+   * Passing neither time removes the override and hands the day back to the
+   * device record.
+   */
+  async admin_set_attendance(ctx, args) {
+    await requireAdmin(ctx, "admin_set_attendance");
+    const workerId = String(args.p_worker_id ?? "");
+    const day = String(args.p_day ?? "");
+    const inAt = (args.p_in as string | null) || null;
+    const outAt = (args.p_out as string | null) || null;
+    const reason = String(args.p_reason ?? "").trim();
+
+    if (!workerId || !day) throw new Error("employee and day are required");
+    if (!reason) throw new Error("a reason is required");
+    if (inAt && outAt && outAt <= inAt) throw new Error("OUT must be later than IN");
+
+    const [wrows] = await ctx.conn.query("SELECT id FROM workers WHERE id = ?", [workerId]);
+    if (!(wrows as unknown[]).length) throw new Error("employee not found");
+
+    // Same guard decide_adjustment applies: a closed run has already been paid.
+    const [clash] = await ctx.conn.query(
+      `SELECT 1 FROM payroll_runs WHERE status = 'closed' AND ? BETWEEN period_start AND period_end LIMIT 1`,
+      [day]
+    );
+    if ((clash as unknown[]).length) {
+      throw new Error(`${day} falls in a closed payroll run and can no longer be edited`);
+    }
+
+    const [prevRows] = await ctx.conn.query(
+      `SELECT id, proposed_in, proposed_out FROM adjustments
+        WHERE worker_id = ? AND day = ? AND status = 'approved'
+        ORDER BY decided_at IS NULL, decided_at DESC LIMIT 1`,
+      [workerId, day]
+    );
+    const prev = (prevRows as Row[])[0] ?? null;
+
+    // One override per worker-day. Superseded ones are dropped rather than
+    // left behind, so recompute cannot pick a stale row out of the ordering.
+    await ctx.conn.query(
+      "DELETE FROM adjustments WHERE worker_id = ? AND day = ? AND status = 'approved'",
+      [workerId, day]
+    );
+
+    if (inAt || outAt) {
+      await ctx.conn.query(
+        `INSERT INTO adjustments
+           (id, worker_id, day, proposed_in, proposed_out, reason, status,
+            requested_by, decided_by, decided_at, decision_reason)
+         VALUES (?,?,?,?,?,?, 'approved', ?, ?, UTC_TIMESTAMP(6), ?)`,
+        [uuid(), workerId, day, inAt, outAt, reason, ctx.userId, ctx.userId, reason]
+      );
+    }
+
+    await writeAudit(
+      ctx,
+      inAt || outAt ? "attendance_timing_set" : "attendance_timing_cleared",
+      "attendance_days",
+      `${workerId}:${day}`,
+      prev ? { proposed_in: prev.proposed_in, proposed_out: prev.proposed_out } : null,
+      inAt || outAt ? { proposed_in: inAt, proposed_out: outAt } : null,
+      reason
+    );
+
+    await recomputeAttendance(ctx, day, day);
+    return null;
+  },
+
   async admin_set_device_pin(ctx, args) {
     await requireAdmin(ctx, "admin_set_device_pin");
     const worker = args.p_worker as string;
     const pin = args.p_pin == null ? null : Number(args.p_pin);
     if (pin != null && pin <= 0) throw new Error("device PIN must be a positive number");
+
+    // Captured before the update so a cleared PIN can be removed from the
+    // terminals — afterwards the old value is gone.
+    const [prevRows] = await ctx.conn.query(
+      "SELECT device_user_id FROM workers WHERE id = ?",
+      [worker]
+    );
+    const prevPin = (prevRows as Row[])[0]?.device_user_id as number | null | undefined;
 
     if (pin != null) {
       const [dupe] = await ctx.conn.query(
@@ -602,12 +880,41 @@ const REGISTRY: Record<string, (ctx: Ctx, args: Row) => Promise<unknown>> = {
       throw new Error(`worker ${worker} not found`);
     }
     await writeAudit(ctx, "worker_device_pin_set", "workers", worker, null, { device_user_id: pin }, null);
+
+    // Mirror the employee onto the terminals so its screen shows a name rather
+    // than a number. Queued after the row is committed-in-transaction and
+    // deliberately not awaited into the transaction's success: a terminal that
+    // is unplugged must not roll back the PIN assignment.
+    const [wrows] = await ctx.conn.query(
+      "SELECT device_user_id, full_name, designation FROM workers WHERE id = ?",
+      [worker]
+    );
+    const w = (wrows as Row[])[0];
+    ctx.afterCommit.push(async () => {
+      if (pin == null) {
+        // PIN cleared — take the old record off the terminals so a stale name
+        // doesn't linger against a number that now belongs to nobody.
+        if (prevPin != null) await removeWorkerFromDevices(Number(prevPin));
+        return;
+      }
+      // A reassigned PIN leaves the previous number pointing at the wrong person.
+      if (prevPin != null && Number(prevPin) !== pin) {
+        await removeWorkerFromDevices(Number(prevPin));
+      }
+      if (w) {
+        await pushWorkerToDevices({
+          device_user_id: pin,
+          full_name: String(w.full_name),
+          designation: (w.designation as string | null) ?? null,
+        });
+      }
+    });
     return null;
   },
 
   async request_new_worker(ctx, args) {
     const p = (args.p ?? {}) as Row;
-    if (ctx.userId !== null && (await roleOf(ctx.conn, ctx.userId)) !== "manager") {
+    if (ctx.userId !== null && !isHrStaff(await roleOf(ctx.conn, ctx.userId))) {
       throw new Error("request_new_worker: managers only");
     }
     const id = uuid();
@@ -675,7 +982,7 @@ const REGISTRY: Record<string, (ctx: Ctx, args: Row) => Promise<unknown>> = {
   async request_worker_edit(ctx, args) {
     const worker = args.p_worker as string;
     const p = (args.p ?? {}) as Row;
-    if (ctx.userId !== null && (await roleOf(ctx.conn, ctx.userId)) !== "manager") {
+    if (ctx.userId !== null && !isHrStaff(await roleOf(ctx.conn, ctx.userId))) {
       throw new Error("request_worker_edit: managers only");
     }
     const [wr] = await ctx.conn.query("SELECT group_id FROM workers WHERE id = ?", [worker]);
@@ -748,7 +1055,7 @@ const REGISTRY: Record<string, (ctx: Ctx, args: Row) => Promise<unknown>> = {
 
     if (ctx.userId !== null) {
       const role = await roleOf(ctx.conn, ctx.userId);
-      if (role !== "admin" && !(role === "manager" && await canDisburseGroup(ctx, w.group_id as string | null))) {
+      if (role !== "admin" && !(isHrStaff(role) && await canDisburseGroup(ctx, w.group_id as string | null))) {
         throw new Error("set_worker_media: not allowed for this worker");
       }
     }
@@ -1062,7 +1369,19 @@ const REGISTRY: Record<string, (ctx: Ctx, args: Row) => Promise<unknown>> = {
 export async function callRpc(name: string, args: Row, userId: string | null): Promise<unknown> {
   const fn = REGISTRY[name];
   if (!fn) throw new Error(`RPC "${name}" has not been ported to MySQL yet.`);
-  return transaction((conn) => fn({ conn, userId }, args));
+
+  const afterCommit: Array<() => Promise<void>> = [];
+  const result = await transaction((conn) => fn({ conn, userId, afterCommit }, args));
+
+  // Only now that the data is durable. Each runs independently and swallows its
+  // own failure — a terminal that is offline must not turn a committed change
+  // into an error the user sees.
+  for (const effect of afterCommit) {
+    await effect().catch((e) =>
+      console.error(`[rpc] ${name} after-commit effect failed:`, e instanceof Error ? e.message : e)
+    );
+  }
+  return result;
 }
 
 export { query };

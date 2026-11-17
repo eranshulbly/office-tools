@@ -2,7 +2,7 @@ import { cookies } from "next/headers";
 import { Query, type Result, type Row } from "./builder";
 import { readToken, sessionCookie } from "./session";
 import { callRpc, isRpcImplemented } from "./rpc";
-import { check, opFor, type Role } from "./authz";
+import { check, opFor, redactedColumns, type Role } from "./authz";
 import { query } from "./pool";
 
 /**
@@ -46,10 +46,16 @@ export class DbClient {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   from<T = any>(table: string): Query<T> {
     if (!this.enforce) return new Query<T>(table);
-    return new Query<T>(table, async (t, op) => {
-      const denial = check(await this.role(), t, opFor(op));
-      return denial ? `permission denied for ${denial.table}: ${denial.reason}` : null;
-    });
+    return new Query<T>(
+      table,
+      async (t, op) => {
+        const denial = check(await this.role(), t, opFor(op));
+        return denial ? `permission denied for ${denial.table}: ${denial.reason}` : null;
+      },
+      // Column-level half of the same policy: the guard decides whether the
+      // table may be read at all, this decides which of its columns come back.
+      async (t) => redactedColumns(await this.role(), t)
+    );
   }
 
   /**

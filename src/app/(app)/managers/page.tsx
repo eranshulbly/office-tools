@@ -1,4 +1,4 @@
-import { requireRole } from "@/lib/auth";
+import { requireFeature } from "@/lib/auth";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { PageHeader, Card, Section, Badge, Empty } from "@/components/ui";
 import type { WorkerGroup } from "@/lib/types";
@@ -9,7 +9,7 @@ type ManagerRow = { id: string; full_name: string };
 type AccessRow = { manager_id: string; group_id: string };
 
 export default async function ManagersPage() {
-  await requireRole("admin");
+  await requireFeature("managers");
 
   const supabase = await createSupabaseServerClient();
   const [{ data: managerData }, { data: groupData }, { data: accessData }] =

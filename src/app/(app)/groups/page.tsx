@@ -1,4 +1,4 @@
-import { requireRole } from "@/lib/auth";
+import { requireFeature } from "@/lib/auth";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { PageHeader, Card, Section, Badge, Empty, Table, Th, Td } from "@/components/ui";
 import type { WorkerGroup } from "@/lib/types";
@@ -14,7 +14,7 @@ type GroupWorker = {
 };
 
 export default async function GroupsPage() {
-  await requireRole("admin");
+  await requireFeature("groups");
 
   const supabase = await createSupabaseServerClient();
   const [{ data: groupData }, { data: workerData }] = await Promise.all([

@@ -13,12 +13,24 @@ const INPUT = "rounded border border-line px-2.5 py-1.5 text-sm";
 
 /** ISO yyyy-mm-dd -> dd/mm/yyyy for display. */
 function fmtDate(iso: string): string {
-  const m = iso.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  const m = iso.slice(0, 10).match(/^(\d{4})-(\d{2})-(\d{2})$/);
   return m ? `${m[3]}/${m[2]}/${m[1]}` : iso;
 }
 
-/** Mark a presented cheque passed (date) or bounced (date + reason). */
-export function OutcomeButtons({ id, today }: { id: string; today: string }) {
+/**
+ * Mark a presented cheque passed, or bounced (reason required).
+ *
+ * The chip carries the date the cheque was banked (presented_date, as chosen on
+ * the present form) — not today. The settlement date is neither asked for nor
+ * shown: the RPC stamps cleared_date itself in the warehouse timezone.
+ */
+export function OutcomeButtons({
+  id,
+  presentedDate,
+}: {
+  id: string;
+  presentedDate: string | null;
+}) {
   const [mode, setMode] = useState<null | "passed" | "bounced">(null);
   const [reason, setReason] = useState("");
   const [error, setError] = useState<string | undefined>();
@@ -31,23 +43,23 @@ export function OutcomeButtons({ id, today }: { id: string; today: string }) {
       return;
     }
     startTransition(async () => {
-      const res = await markOutcome(id, passed, today, reason.trim());
+      const res = await markOutcome(id, passed, reason.trim());
       if (res.error) setError(res.error);
       else { setMode(null); setReason(""); }
     });
   }
 
-  // The settle date sits inline next to the buttons (same shape as the present
-  // form). "Passed" commits straight away; "Bounced" first asks for a reason,
-  // which the RPC requires.
+  // "Passed" commits straight away; "Bounced" first asks for a reason, which the
+  // RPC requires.
   return (
     <div className="flex flex-col items-start gap-1.5 lg:items-end">
       <div className="flex flex-wrap items-center gap-2 sm:flex-nowrap">
         <span
-          title="Settled today — this date is fixed"
-          className="rounded border border-line bg-[var(--color-surface-2)] px-2.5 py-1.5 text-sm tabular text-muted"
+          title="Date this cheque was presented to the bank"
+          className="rounded border border-line bg-[var(--color-surface-2)] px-2.5 py-1.5 text-sm text-muted"
         >
-          {fmtDate(today)}
+          Presented{" "}
+          <span className="tabular">{presentedDate ? fmtDate(presentedDate) : "—"}</span>
         </span>
         <button
           type="button"

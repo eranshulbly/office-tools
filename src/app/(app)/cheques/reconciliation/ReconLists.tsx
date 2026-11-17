@@ -58,15 +58,16 @@ export function ReconLists({
   accounts,
   awaiting,
   settled,
-  today,
   presentDate,
+  presentOnly = false,
 }: {
   present: PresentItem[];
   accounts: PresentAccount[];
   awaiting: OutcomeItem[];
   settled: SettledItem[];
-  today: string;
   presentDate: string;
+  /** ops_manager: only the "to present" queue exists — no tab bar, no outcomes. */
+  presentOnly?: boolean;
 }) {
   const [q, setQ] = useState("");
   const [tab, setTab] = useState<Tab>("present");
@@ -106,14 +107,24 @@ export function ReconLists({
     return source.filter((c) => !c.cheque_date).length;
   }, [before, tab, present, awaiting, settled]);
 
-  const TABS: { key: Tab; label: string; count: number }[] = [
-    { key: "present", label: "To present to bank", count: fPresent.length },
-    { key: "awaiting", label: "Presented — awaiting clearance", count: fAwaiting.length },
-    { key: "settled", label: "Recently settled", count: fSettled.length },
-  ];
+  // With only one list there is nothing to switch between, so the tab bar is
+  // dropped entirely rather than rendered with a single disabled-looking chip.
+  const TABS: { key: Tab; label: string; count: number }[] = presentOnly
+    ? []
+    : [
+        { key: "present", label: "To present to bank", count: fPresent.length },
+        { key: "awaiting", label: "Presented — awaiting clearance", count: fAwaiting.length },
+        { key: "settled", label: "Recently settled", count: fSettled.length },
+      ];
 
   return (
     <>
+      {presentOnly && (
+        <div className="mb-4 text-sm text-muted">
+          {fPresent.length} cheque{fPresent.length === 1 ? "" : "s"} waiting to be presented.
+        </div>
+      )}
+
       <div className="mb-4 grid grid-cols-1 gap-2 sm:grid-cols-3">
         {TABS.map((t) => {
           const active = tab === t.key;
@@ -183,13 +194,19 @@ export function ReconLists({
         ) : (
           <div className="space-y-2">
             {fPresent.map((c) => (
-              <PresentCard key={c.id} item={c} accounts={accounts} defaultDate={presentDate} />
+              <PresentCard
+                key={c.id}
+                item={c}
+                accounts={accounts}
+                defaultDate={presentDate}
+                canEdit={!presentOnly}
+              />
             ))}
           </div>
         )
       )}
 
-      {tab === "awaiting" && (
+      {!presentOnly && tab === "awaiting" && (
         fAwaiting.length === 0 ? (
           <Empty>{emptyText("No presented cheques awaiting an outcome.")}</Empty>
         ) : (
@@ -210,7 +227,7 @@ export function ReconLists({
                   )}
                 </div>
                 <div className="lg:shrink-0">
-                  <OutcomeButtons id={c.id} today={today} />
+                  <OutcomeButtons id={c.id} presentedDate={c.presented_date} />
                 </div>
               </Card>
             ))}
@@ -218,7 +235,7 @@ export function ReconLists({
         )
       )}
 
-      {tab === "settled" && (
+      {!presentOnly && tab === "settled" && (
         fSettled.length === 0 ? (
           <Empty>{emptyText("Nothing settled yet.")}</Empty>
         ) : (

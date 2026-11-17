@@ -81,6 +81,22 @@ export function WorkerForm({
   const [state, formAction, pending] = useActionState<WorkerFormState, FormData>(action, {});
   const todayStr = new Date().toLocaleDateString("en-CA");
 
+  /**
+   * On EDIT, nothing is mandatory — not even the salary.
+   *
+   * Every field being mandatory made the form unusable for its most common
+   * job: opening an existing employee to change one thing. The records were
+   * imported without phone, group or salary, so saving anything meant first
+   * inventing the rest — data worse than the blank it replaced. Requiring just
+   * the salary still blocked the 28 people who do not have one on file.
+   *
+   * A blank box keeps whatever is stored; it never writes an empty value.
+   *
+   * Creating a new employee still asks for the full set: that is the one moment
+   * the information is actually to hand.
+   */
+  const creating = mode === "create";
+
   async function onSubmit(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
     const fd = new FormData(e.currentTarget);
@@ -114,24 +130,63 @@ export function WorkerForm({
           <input
             name="full_name"
             type="text"
-            required
+            required={creating}
             pattern="[A-Za-z][A-Za-z .'-]{1,}"
             title="Letters, spaces, and . ' - only (no digits)."
-            defaultValue={worker?.full_name ?? ""}
+            defaultValue={worker?.full_name_only ?? worker?.full_name ?? ""}
             className={inputClass}
           />
         </Field>
 
-        <Field label="Monthly salary (₹)">
+        <Field label="Designation">
           <input
-            name="monthly_salary"
-            type="number"
-            step="0.01"
-            min="0.01"
-            required
-            defaultValue={worker ? String(worker.monthly_salary) : ""}
+            name="designation"
+            type="text"
+            maxLength={120}
+            placeholder="Driver, Store Keeper, Helper…"
+            defaultValue={worker?.designation ?? ""}
             className={inputClass}
           />
+          <p className="mt-1 text-xs text-faint">
+            Shown on the attendance device as &ldquo;Name - Designation&rdquo;.
+          </p>
+        </Field>
+
+        <Field label="Monthly salary (₹)">
+          {/*
+            Whole rupees, typed only.
+
+            Not type="number": that renders the up/down spinner, and it also
+            makes the field respond to the MOUSE WHEEL — scrolling the page
+            with the cursor over it silently edits the amount. On a salary
+            field that is a quiet way to pay somebody the wrong number.
+
+            type="text" with inputMode="numeric" removes both and still brings
+            up the numeric keypad on a phone. The pattern blocks a decimal
+            point in the browser; the server checks for a whole number too,
+            since a pattern is only a hint.
+          */}
+          <input
+            name="monthly_salary"
+            type="text"
+            inputMode="numeric"
+            pattern="[0-9]+"
+            title="Whole rupees only — digits, no decimal point or commas."
+            autoComplete="off"
+            required={creating}
+            defaultValue={
+              worker && worker.monthly_salary != null
+                ? String(Math.round(Number(worker.monthly_salary)))
+                : ""
+            }
+            className={inputClass}
+          />
+          {!creating && (
+            <p className="mt-1 text-xs text-faint">
+              Payroll cannot run without this, but it is not required to save — leave it
+              blank and the current value is kept, like every other field here.
+            </p>
+          )}
         </Field>
 
         <Field label="Bank account">
@@ -153,8 +208,13 @@ export function WorkerForm({
         </Field>
 
         <Field label="Group">
-          <select name="group_id" required defaultValue={extra?.group_id ?? ""} className={inputClass}>
-            <option value="" disabled>
+          <select
+            name="group_id"
+            required={creating}
+            defaultValue={extra?.group_id ?? ""}
+            className={inputClass}
+          >
+            <option value="" disabled={creating}>
               — select a group —
             </option>
             {groups.map((g) => (
@@ -169,7 +229,7 @@ export function WorkerForm({
           <input
             name="phone"
             type="tel"
-            required
+            required={creating}
             pattern="(\+?91[- ]?)?[6-9][0-9]{9}"
             title="10-digit Indian mobile number (optionally with +91)."
             defaultValue={extra?.phone ?? ""}
@@ -181,7 +241,7 @@ export function WorkerForm({
           <input
             name="joined_on"
             type="date"
-            required
+            required={creating}
             max={todayStr}
             defaultValue={worker?.joined_on ?? ""}
             className={inputClass}
